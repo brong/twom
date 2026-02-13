@@ -3514,6 +3514,57 @@ static void test_error_cases(void)
 
 /*
  * ============================================================
+ * test_commit_readonly
+ *
+ * Commit (rather than abort) a read-only transaction.
+ * ============================================================
+ */
+static void test_commit_readonly(void)
+{
+    struct twom_db *db = NULL;
+    struct twom_txn *txn = NULL;
+    int r;
+
+    struct twom_open_data init = TWOM_OPEN_DATA_INITIALIZER;
+    init.flags = TWOM_CREATE;
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    CANSTORE("key1", 4, "val1", 4);
+    CANCOMMIT();
+
+    /* begin a read-only transaction */
+    r = twom_db_begin_txn(db, TWOM_SHARED, &txn);
+    ASSERT_OK(r);
+
+    /* fetch within the read txn */
+    CANFETCH("key1", 4, "val1", 4);
+
+    /* commit the read-only transaction (instead of abort) */
+    r = twom_txn_commit(&txn);
+    ASSERT_OK(r);
+    ASSERT(txn == NULL);
+
+    /* also test committing an MVCC read transaction */
+    r = twom_db_begin_txn(db, TWOM_SHARED | TWOM_MVCC, &txn);
+    ASSERT_OK(r);
+
+    CANFETCH("key1", 4, "val1", 4);
+
+    r = twom_txn_commit(&txn);
+    ASSERT_OK(r);
+    ASSERT(txn == NULL);
+
+    /* database still works after committing read txns */
+    CANFETCH_NOTXN("key1", 4, "val1", 4);
+    ISCONSISTENT();
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+}
+
+/*
+ * ============================================================
  * Custom comparison functions for tests
  * ============================================================
  */
@@ -4035,6 +4086,7 @@ static struct test_entry tests[] = {
     { "test_open_with_txn",      test_open_with_txn },
     { "test_foreach_goodp",      test_foreach_goodp },
     { "test_error_cases",        test_error_cases },
+    { "test_commit_readonly",    test_commit_readonly },
     { "test_compar_reverse",     test_compar_reverse },
     { "test_compar_caseless",    test_compar_caseless },
     { NULL, NULL }
