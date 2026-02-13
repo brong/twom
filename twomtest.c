@@ -503,17 +503,6 @@ static void test_openclose(void)
 
 /*
  * ============================================================
- * Test 2: test_openclose_mkdir — SKIP
- * ============================================================
- */
-
-static void test_openclose_mkdir(void)
-{
-    SKIP("twom doesn't create directories; this is a cyrusdb wrapper feature");
-}
-
-/*
- * ============================================================
  * Test 3: test_multiopen
  * ============================================================
  */
@@ -2101,7 +2090,6 @@ struct test_entry {
 
 static struct test_entry tests[] = {
     { "test_openclose",          test_openclose },
-    { "test_openclose_mkdir",    test_openclose_mkdir },
     { "test_multiopen",          test_multiopen },
     { "test_read_and_delete",    test_read_and_delete },
     { "test_replace_before_delete", test_replace_before_delete },
