@@ -3179,6 +3179,340 @@ static void test_strerror(void)
 
 /*
  * ============================================================
+ * Additional coverage tests
+ * ============================================================
+ */
+
+static void test_should_repack(void)
+{
+    struct twom_db *db = NULL;
+    int r;
+
+    struct twom_open_data init = TWOM_OPEN_DATA_INITIALIZER;
+    init.flags = TWOM_CREATE;
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    /* empty db should not need repack */
+    ASSERT(!twom_db_should_repack(db));
+
+    /* store enough data to exceed MINREWRITE (16834 bytes) of dirty space */
+    char key[32];
+    char val[256];
+    memset(val, 'x', sizeof(val));
+
+    for (int i = 0; i < 200; i++) {
+        int klen = snprintf(key, sizeof(key), "key-%04d", i);
+        r = twom_db_store(db, key, klen, val, sizeof(val), 0);
+        ASSERT_OK(r);
+    }
+
+    /* still shouldn't need repack - no dirty space yet */
+    ASSERT(!twom_db_should_repack(db));
+
+    /* now delete all records to create dirty space */
+    for (int i = 0; i < 200; i++) {
+        int klen = snprintf(key, sizeof(key), "key-%04d", i);
+        r = twom_db_store(db, key, klen, NULL, 0, 0);
+        ASSERT_OK(r);
+    }
+
+    /* should now recommend repack (dirty_size > MINREWRITE and
+     * current_size < 4 * dirty_size) */
+    ASSERT(twom_db_should_repack(db));
+
+    /* repack should clear the dirty space */
+    r = twom_db_repack(db);
+    ASSERT_OK(r);
+
+    ASSERT(!twom_db_should_repack(db));
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+}
+
+static void test_nonblocking(void)
+{
+    struct twom_db *db = NULL;
+    struct twom_txn *txn = NULL;
+    int r;
+
+    /* create a database */
+    struct twom_open_data init = TWOM_OPEN_DATA_INITIALIZER;
+    init.flags = TWOM_CREATE;
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    CANSTORE("key", 3, "value", 5);
+    CANCOMMIT();
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+    db = NULL;
+
+    /* set up pipes */
+    int p2c[2], c2p[2];
+    r = pipe(p2c);
+    ASSERT_EQ(r, 0);
+    r = pipe(c2p);
+    ASSERT_EQ(r, 0);
+
+    pid_t pid = fork();
+    ASSERT(pid >= 0);
+
+    if (pid == 0) {
+        /* === CHILD === */
+        close(p2c[1]);
+        close(c2p[0]);
+
+        wait_for_peer(p2c[0]);
+
+        /* try to open with NONBLOCKING - the open itself takes a read lock,
+         * which conflicts with the parent's write lock. With NONBLOCKING
+         * this should fail immediately with TWOM_LOCKED */
+        struct twom_open_data cinit = TWOM_OPEN_DATA_INITIALIZER;
+        cinit.flags = TWOM_NONBLOCKING;
+        struct twom_db *cdb = NULL;
+
+        int cr = twom_db_open(filename, &cinit, &cdb, NULL);
+        int got_locked = (cr == TWOM_LOCKED);
+
+        if (cdb) {
+            cr = twom_db_close(&cdb);
+            assert(cr == TWOM_OK);
+        }
+
+        /* send result: 'Y' = got locked as expected, 'N' = didn't */
+        char result = got_locked ? 'Y' : 'N';
+        ssize_t n = write(c2p[1], &result, 1);
+        assert(n == 1);
+
+        wait_for_peer(p2c[0]);
+
+        close(p2c[0]);
+        close(c2p[1]);
+        _exit(0);
+    }
+
+    /* === PARENT === */
+    close(p2c[0]);
+    close(c2p[1]);
+
+    /* open db and hold a write lock */
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    r = twom_db_begin_txn(db, 0, &txn);
+    ASSERT_OK(r);
+
+    /* signal child to try its nonblocking lock, then read result */
+    signal_peer(p2c[1]);
+
+    char result;
+    ssize_t n = read(c2p[0], &result, 1);
+    ASSERT_EQ(n, 1);
+    ASSERT_EQ(result, 'Y');
+
+    /* clean up */
+    r = twom_txn_abort(&txn);
+    ASSERT_OK(r);
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+
+    signal_peer(p2c[1]);
+
+    int status;
+    waitpid(pid, &status, 0);
+    ASSERT(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+
+    close(p2c[1]);
+    close(c2p[0]);
+}
+
+static int alwaysyield_cb(void *rock, const char *key, size_t keylen,
+                           const char *data, size_t datalen)
+{
+    (void)key; (void)keylen; (void)data; (void)datalen;
+    int *count = (int *)rock;
+    (*count)++;
+    return 0;
+}
+
+static void test_alwaysyield(void)
+{
+    struct twom_db *db = NULL;
+    struct twom_txn *txn = NULL;
+    int r;
+
+    struct twom_open_data init = TWOM_OPEN_DATA_INITIALIZER;
+    init.flags = TWOM_CREATE;
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    /* store several records */
+    CANSTORE("a", 1, "1", 1);
+    CANSTORE("b", 1, "2", 1);
+    CANSTORE("c", 1, "3", 1);
+    CANSTORE("d", 1, "4", 1);
+    CANSTORE("e", 1, "5", 1);
+    CANCOMMIT();
+
+    /* iterate with ALWAYSYIELD - should still visit all records */
+    int count = 0;
+    r = twom_db_foreach(db, NULL, 0, NULL, alwaysyield_cb, &count,
+                        TWOM_ALWAYSYIELD);
+    ASSERT_OK(r);
+    ASSERT_EQ(count, 5);
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+}
+
+static void test_open_with_txn(void)
+{
+    struct twom_db *db = NULL;
+    struct twom_txn *txn = NULL;
+    int r;
+
+    /* open with tidptr to get a write transaction immediately */
+    struct twom_open_data init = TWOM_OPEN_DATA_INITIALIZER;
+    init.flags = TWOM_CREATE;
+    r = twom_db_open(filename, &init, &db, &txn);
+    ASSERT_OK(r);
+    ASSERT_NOT_NULL(db);
+    ASSERT_NOT_NULL(txn);
+
+    /* use the returned txn directly */
+    r = twom_txn_store(txn, "key1", 4, "val1", 4, 0);
+    ASSERT_OK(r);
+    r = twom_txn_store(txn, "key2", 4, "val2", 4, 0);
+    ASSERT_OK(r);
+
+    r = twom_txn_commit(&txn);
+    ASSERT_OK(r);
+
+    /* verify data */
+    CANFETCH("key1", 4, "val1", 4);
+    CANFETCH("key2", 4, "val2", 4);
+    CANCOMMIT();
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+}
+
+static int goodp_filter(void *rock, const char *key, size_t keylen,
+                         const char *data, size_t datalen)
+{
+    (void)rock; (void)data; (void)datalen;
+    /* only accept keys starting with 'b' */
+    return (keylen > 0 && key[0] == 'b');
+}
+
+struct foreach_result {
+    int count;
+    char keys[10][32];
+};
+
+static int collect_cb(void *rock, const char *key, size_t keylen,
+                       const char *data, size_t datalen)
+{
+    (void)data; (void)datalen;
+    struct foreach_result *res = (struct foreach_result *)rock;
+    if (res->count < 10 && keylen < 32) {
+        memcpy(res->keys[res->count], key, keylen);
+        res->keys[res->count][keylen] = '\0';
+    }
+    res->count++;
+    return 0;
+}
+
+static void test_foreach_goodp(void)
+{
+    struct twom_db *db = NULL;
+    struct twom_txn *txn = NULL;
+    int r;
+
+    struct twom_open_data init = TWOM_OPEN_DATA_INITIALIZER;
+    init.flags = TWOM_CREATE;
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    CANSTORE("apple", 5, "1", 1);
+    CANSTORE("banana", 6, "2", 1);
+    CANSTORE("blueberry", 9, "3", 1);
+    CANSTORE("cherry", 6, "4", 1);
+    CANSTORE("boysenberry", 11, "5", 1);
+    CANCOMMIT();
+
+    /* foreach with goodp filter - only keys starting with 'b' */
+    struct foreach_result res = { 0, {{0}} };
+    r = twom_db_foreach(db, NULL, 0, goodp_filter, collect_cb, &res, 0);
+    ASSERT_OK(r);
+    ASSERT_EQ(res.count, 3);
+    ASSERT_STR_EQ(res.keys[0], "banana");
+    ASSERT_STR_EQ(res.keys[1], "blueberry");
+    ASSERT_STR_EQ(res.keys[2], "boysenberry");
+
+    /* without filter - should get all 5 */
+    memset(&res, 0, sizeof(res));
+    r = twom_db_foreach(db, NULL, 0, NULL, collect_cb, &res, 0);
+    ASSERT_OK(r);
+    ASSERT_EQ(res.count, 5);
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+}
+
+static void test_error_cases(void)
+{
+    struct twom_db *db = NULL;
+    struct twom_txn *txn = NULL;
+    int r;
+
+    /* open nonexistent file without CREATE should fail */
+    struct twom_open_data init = TWOM_OPEN_DATA_INITIALIZER;
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_EQ(r, TWOM_NOTFOUND);
+    ASSERT_NULL(db);
+
+    /* create the db for remaining tests */
+    init.flags = TWOM_CREATE;
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    CANSTORE("key", 3, "val", 3);
+    CANCOMMIT();
+
+    /* close and close again (double-close should be safe) */
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+    ASSERT_NULL(db);
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+
+    /* fetch from non-existent key */
+    init.flags = 0;
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    CANNOTFETCH_NOTXN("nokey", 5, TWOM_NOTFOUND);
+
+    /* FETCHNEXT past last key */
+    CANNOTFETCHNEXT("key", 3, TWOM_NOTFOUND);
+
+    /* abort the txn that CANNOTFETCHNEXT auto-began */
+    r = twom_txn_abort(&txn);
+    ASSERT_OK(r);
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+}
+
+/*
+ * ============================================================
  * Test runner
  * ============================================================
  */
@@ -3224,6 +3558,12 @@ static struct test_entry tests[] = {
     { "test_dump",               test_dump },
     { "test_txn_yield",          test_txn_yield },
     { "test_strerror",           test_strerror },
+    { "test_should_repack",      test_should_repack },
+    { "test_nonblocking",        test_nonblocking },
+    { "test_alwaysyield",        test_alwaysyield },
+    { "test_open_with_txn",      test_open_with_txn },
+    { "test_foreach_goodp",      test_foreach_goodp },
+    { "test_error_cases",        test_error_cases },
     { NULL, NULL }
 };
 
