@@ -1,4 +1,7 @@
 *.o
 *.a
+*.so
+*.so.*
 twomtool
 twomtest
+twom.pc

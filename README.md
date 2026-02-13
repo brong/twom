@@ -30,10 +30,27 @@ This software is available under any of the following licenses, at your choice:
 ## Building
 
 ```
-make            # builds libtwom.a, twomtool, twomtest
+make            # builds libtwom.a, libtwom.so, twomtool, twomtest
 make check      # runs the test suite
 make clean      # removes build artifacts
 ```
+
+## Installing
+
+```
+sudo make install                     # installs to /usr/local
+sudo make PREFIX=/usr install         # installs to /usr
+make DESTDIR=/tmp/staging install     # staged install for packaging
+sudo make uninstall                   # removes installed files
+```
+
+Installs:
+- `libtwom.a` and `libtwom.so` (with soname versioning) to `$(LIBDIR)`
+- `twom.h` to `$(INCLUDEDIR)`
+- `twomtool` to `$(BINDIR)`
+- `twom.pc` to `$(PKGCONFIGDIR)` for pkg-config
+
+After installing the shared library, run `sudo ldconfig` to update the linker cache.
 
 ## Library usage
 
