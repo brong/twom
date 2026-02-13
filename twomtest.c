@@ -3514,6 +3514,476 @@ static void test_error_cases(void)
 
 /*
  * ============================================================
+ * Custom comparison functions for tests
+ * ============================================================
+ */
+
+static int compar_reverse(const char *a, size_t al, const char *b, size_t bl)
+{
+    /* reverse the normal byte ordering */
+    size_t min = al < bl ? al : bl;
+    int r = min ? memcmp(a, b, min) : 0;
+    if (r) return -r;
+    if (al > bl) return -1;
+    if (bl > al) return 1;
+    return 0;
+}
+
+static int compar_caseless(const char *a, size_t al, const char *b, size_t bl)
+{
+    size_t min = al < bl ? al : bl;
+    for (size_t i = 0; i < min; i++) {
+        int ca = (unsigned char)a[i];
+        int cb = (unsigned char)b[i];
+        if (ca >= 'A' && ca <= 'Z') ca += 32;
+        if (cb >= 'A' && cb <= 'Z') cb += 32;
+        if (ca != cb) return ca - cb;
+    }
+    if (al > bl) return 1;
+    if (bl > al) return -1;
+    return 0;
+}
+
+/*
+ * ============================================================
+ * test_compar_reverse
+ *
+ * Custom comparison that reverses the default byte ordering.
+ * Verifies that iteration, fetch, fetchnext, delete, and
+ * repack all honour the custom order.
+ * ============================================================
+ */
+static void test_compar_reverse(void)
+{
+    struct twom_db *db = NULL;
+    struct twom_txn *txn = NULL;
+    int r;
+
+    struct twom_open_data init = TWOM_OPEN_DATA_INITIALIZER;
+    init.flags = TWOM_CREATE | TWOM_COMPAR_EXTERNAL;
+    init.compar = compar_reverse;
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    /* insert several keys */
+    CANSTORE("apple", 5, "val_a", 5);
+    CANSTORE("banana", 6, "val_b", 5);
+    CANSTORE("cherry", 6, "val_c", 5);
+    CANSTORE("date", 4, "val_d", 5);
+    CANCOMMIT();
+    ISCONSISTENT();
+
+    /* iteration should be in reverse byte order: date, cherry, banana, apple */
+    struct twom_cursor *cur = NULL;
+    r = twom_db_begin_cursor(db, NULL, 0, &cur, TWOM_SHARED);
+    ASSERT_OK(r);
+
+    const char *key, *val;
+    size_t keylen, vallen;
+
+    r = twom_cursor_next(cur, &key, &keylen, &val, &vallen);
+    ASSERT_OK(r);
+    ASSERT_EQ(keylen, 4); ASSERT(memcmp(key, "date", 4) == 0);
+
+    r = twom_cursor_next(cur, &key, &keylen, &val, &vallen);
+    ASSERT_OK(r);
+    ASSERT_EQ(keylen, 6); ASSERT(memcmp(key, "cherry", 6) == 0);
+
+    r = twom_cursor_next(cur, &key, &keylen, &val, &vallen);
+    ASSERT_OK(r);
+    ASSERT_EQ(keylen, 6); ASSERT(memcmp(key, "banana", 6) == 0);
+
+    r = twom_cursor_next(cur, &key, &keylen, &val, &vallen);
+    ASSERT_OK(r);
+    ASSERT_EQ(keylen, 5); ASSERT(memcmp(key, "apple", 5) == 0);
+
+    r = twom_cursor_next(cur, &key, &keylen, &val, &vallen);
+    ASSERT_EQ(r, TWOM_DONE);
+
+    r = twom_cursor_abort(&cur);
+    ASSERT_OK(r);
+
+    /* fetch individual keys */
+    CANFETCH("cherry", 6, "val_c", 5);
+    CANFETCH("apple", 5, "val_a", 5);
+    CANCOMMIT();
+
+    /* fetchnext in reverse order: after "cherry" comes "banana" */
+    txn = NULL;
+    r = twom_db_begin_txn(db, TWOM_SHARED, &txn);
+    ASSERT_OK(r);
+    CANFETCHNEXT("cherry", 6, "banana", 6, "val_b", 5);
+    /* after "banana" comes "apple" */
+    CANFETCHNEXT("banana", 6, "apple", 5, "val_a", 5);
+    /* after "apple" (last in reverse) there's nothing */
+    CANNOTFETCHNEXT("apple", 5, TWOM_NOTFOUND);
+    r = twom_txn_abort(&txn);
+    ASSERT_OK(r);
+    txn = NULL;
+
+    /* replace a value and check */
+    CANSTORE("banana", 6, "val_B", 5);
+    CANCOMMIT();
+    CANFETCH_NOTXN("banana", 6, "val_B", 5);
+    ISCONSISTENT();
+
+    /* delete a key */
+    CANDELETE("cherry", 6);
+    CANCOMMIT();
+    CANNOTFETCH_NOTXN("cherry", 6, TWOM_NOTFOUND);
+    ISCONSISTENT();
+
+    /* remaining order: date, banana, apple */
+    r = twom_db_begin_cursor(db, NULL, 0, &cur, TWOM_SHARED);
+    ASSERT_OK(r);
+
+    r = twom_cursor_next(cur, &key, &keylen, &val, &vallen);
+    ASSERT_OK(r);
+    ASSERT_EQ(keylen, 4); ASSERT(memcmp(key, "date", 4) == 0);
+
+    r = twom_cursor_next(cur, &key, &keylen, &val, &vallen);
+    ASSERT_OK(r);
+    ASSERT_EQ(keylen, 6); ASSERT(memcmp(key, "banana", 6) == 0);
+
+    r = twom_cursor_next(cur, &key, &keylen, &val, &vallen);
+    ASSERT_OK(r);
+    ASSERT_EQ(keylen, 5); ASSERT(memcmp(key, "apple", 5) == 0);
+
+    r = twom_cursor_next(cur, &key, &keylen, &val, &vallen);
+    ASSERT_EQ(r, TWOM_DONE);
+
+    r = twom_cursor_abort(&cur);
+    ASSERT_OK(r);
+
+    /* repack and verify order is preserved */
+    r = twom_db_repack(db);
+    ASSERT_OK(r);
+    ISCONSISTENT();
+
+    r = twom_db_begin_cursor(db, NULL, 0, &cur, TWOM_SHARED);
+    ASSERT_OK(r);
+
+    r = twom_cursor_next(cur, &key, &keylen, &val, &vallen);
+    ASSERT_OK(r);
+    ASSERT_EQ(keylen, 4); ASSERT(memcmp(key, "date", 4) == 0);
+
+    r = twom_cursor_next(cur, &key, &keylen, &val, &vallen);
+    ASSERT_OK(r);
+    ASSERT_EQ(keylen, 6); ASSERT(memcmp(key, "banana", 6) == 0);
+
+    r = twom_cursor_next(cur, &key, &keylen, &val, &vallen);
+    ASSERT_OK(r);
+    ASSERT_EQ(keylen, 5); ASSERT(memcmp(key, "apple", 5) == 0);
+
+    r = twom_cursor_next(cur, &key, &keylen, &val, &vallen);
+    ASSERT_EQ(r, TWOM_DONE);
+
+    r = twom_cursor_abort(&cur);
+    ASSERT_OK(r);
+
+    /* close and reopen with the same compar, verify it still works */
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    CANFETCH_NOTXN("banana", 6, "val_B", 5);
+    CANFETCH_NOTXN("date", 4, "val_d", 5);
+    ISCONSISTENT();
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+}
+
+/*
+ * ============================================================
+ * test_compar_caseless
+ *
+ * Case-insensitive comparison: keys that differ only in case
+ * are treated as the same key.  Verifies:
+ * - store with different case overwrites the value
+ * - iteration returns the key with the most recent case
+ * - MVCC snapshot sees the old key case and old value
+ * - repack preserves correct behavior
+ * ============================================================
+ */
+static void test_compar_caseless(void)
+{
+    struct twom_db *db = NULL;
+    struct twom_txn *txn = NULL;
+    int r;
+
+    struct twom_open_data init = TWOM_OPEN_DATA_INITIALIZER;
+    init.flags = TWOM_CREATE | TWOM_COMPAR_EXTERNAL;
+    init.compar = compar_caseless;
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    /* --- basic case-insensitive equivalence --- */
+
+    /* store with lowercase key */
+    CANSTORE("hello", 5, "val1", 4);
+    CANCOMMIT();
+
+    /* fetch with various cases should all find the same record */
+    CANFETCH_NOTXN("hello", 5, "val1", 4);
+    CANFETCH_NOTXN("Hello", 5, "val1", 4);
+    CANFETCH_NOTXN("HELLO", 5, "val1", 4);
+    CANFETCH_NOTXN("hElLo", 5, "val1", 4);
+
+    /* overwrite with different case: this should replace, not add */
+    CANSTORE("HELLO", 5, "val2", 4);
+    CANCOMMIT();
+    ISCONSISTENT();
+
+    /* num_records should be 1, not 2 */
+    ASSERT_EQ(twom_db_num_records(db), 1);
+
+    /* fetching with any case returns the new value */
+    CANFETCH_NOTXN("hello", 5, "val2", 4);
+    CANFETCH_NOTXN("HELLO", 5, "val2", 4);
+
+    /* the returned key should be "HELLO" (most recent case) */
+    {
+        const char *fkey, *fval;
+        size_t fkeylen, fvallen;
+        r = twom_db_fetch(db, "hello", 5, &fkey, &fkeylen,
+                          &fval, &fvallen, 0);
+        ASSERT_OK(r);
+        ASSERT_EQ(fkeylen, 5);
+        ASSERT(memcmp(fkey, "HELLO", 5) == 0); /* most recent case */
+        ASSERT_EQ(fvallen, 4);
+        ASSERT(memcmp(fval, "val2", 4) == 0);
+    }
+
+    /* --- iteration returns most recent key case --- */
+
+    CANSTORE("Apple", 5, "fruit_a", 7);
+    CANSTORE("banana", 6, "fruit_b", 7);
+    CANCOMMIT();
+    ISCONSISTENT();
+
+    /* iteration: Apple, banana, HELLO (case-insensitive sort order) */
+    {
+        struct twom_cursor *cur = NULL;
+        const char *key, *val;
+        size_t keylen, vallen;
+
+        r = twom_db_begin_cursor(db, NULL, 0, &cur, TWOM_SHARED);
+        ASSERT_OK(r);
+
+        r = twom_cursor_next(cur, &key, &keylen, &val, &vallen);
+        ASSERT_OK(r);
+        ASSERT_EQ(keylen, 5);
+        ASSERT(memcmp(key, "Apple", 5) == 0);
+        ASSERT(memcmp(val, "fruit_a", 7) == 0);
+
+        r = twom_cursor_next(cur, &key, &keylen, &val, &vallen);
+        ASSERT_OK(r);
+        ASSERT_EQ(keylen, 6);
+        ASSERT(memcmp(key, "banana", 6) == 0);
+        ASSERT(memcmp(val, "fruit_b", 7) == 0);
+
+        r = twom_cursor_next(cur, &key, &keylen, &val, &vallen);
+        ASSERT_OK(r);
+        ASSERT_EQ(keylen, 5);
+        ASSERT(memcmp(key, "HELLO", 5) == 0);
+        ASSERT(memcmp(val, "val2", 4) == 0);
+
+        r = twom_cursor_next(cur, &key, &keylen, &val, &vallen);
+        ASSERT_EQ(r, TWOM_DONE);
+
+        r = twom_cursor_abort(&cur);
+        ASSERT_OK(r);
+    }
+
+    /* --- overwrite with new case, then check iteration key case --- */
+    CANSTORE("APPLE", 5, "fruit_2", 7);
+    CANCOMMIT();
+
+    {
+        const char *fkey, *fval;
+        size_t fkeylen, fvallen;
+        r = twom_db_fetch(db, "apple", 5, &fkey, &fkeylen,
+                          &fval, &fvallen, 0);
+        ASSERT_OK(r);
+        ASSERT_EQ(fkeylen, 5);
+        ASSERT(memcmp(fkey, "APPLE", 5) == 0); /* updated case */
+        ASSERT(memcmp(fval, "fruit_2", 7) == 0);
+    }
+
+    /* --- MVCC: snapshot sees old key case and old value --- */
+
+    /* start an MVCC read transaction to freeze the current state */
+    struct twom_txn *mvcc_txn = NULL;
+    r = twom_db_begin_txn(db, TWOM_SHARED | TWOM_MVCC, &mvcc_txn);
+    ASSERT_OK(r);
+
+    /* release the lock so we can write */
+    r = twom_txn_yield(mvcc_txn);
+    ASSERT_OK(r);
+
+    /* now overwrite "banana" with "BANANA" and a new value */
+    CANSTORE("BANANA", 6, "fruit_4", 7);
+    CANCOMMIT();
+
+    /* also overwrite HELLO -> Hello with new value */
+    CANSTORE("Hello", 5, "val3", 4);
+    CANCOMMIT();
+
+    /* current (non-MVCC) view should see the new cases and values */
+    {
+        const char *fkey, *fval;
+        size_t fkeylen, fvallen;
+        r = twom_db_fetch(db, "banana", 6, &fkey, &fkeylen,
+                          &fval, &fvallen, 0);
+        ASSERT_OK(r);
+        ASSERT(memcmp(fkey, "BANANA", 6) == 0);
+        ASSERT(memcmp(fval, "fruit_4", 7) == 0);
+
+        r = twom_db_fetch(db, "hello", 5, &fkey, &fkeylen,
+                          &fval, &fvallen, 0);
+        ASSERT_OK(r);
+        ASSERT(memcmp(fkey, "Hello", 5) == 0);
+        ASSERT(memcmp(fval, "val3", 4) == 0);
+    }
+
+    /* MVCC transaction should still see the OLD key cases and values */
+    {
+        const char *fkey, *fval;
+        size_t fkeylen, fvallen;
+
+        r = twom_txn_fetch(mvcc_txn, "banana", 6, &fkey, &fkeylen,
+                           &fval, &fvallen, 0);
+        ASSERT_OK(r);
+        ASSERT_EQ(fkeylen, 6);
+        ASSERT(memcmp(fkey, "banana", 6) == 0); /* old case */
+        ASSERT_EQ(fvallen, 7);
+        ASSERT(memcmp(fval, "fruit_b", 7) == 0); /* old value */
+
+        r = twom_txn_fetch(mvcc_txn, "HELLO", 5, &fkey, &fkeylen,
+                           &fval, &fvallen, 0);
+        ASSERT_OK(r);
+        ASSERT_EQ(fkeylen, 5);
+        ASSERT(memcmp(fkey, "HELLO", 5) == 0); /* old case */
+        ASSERT_EQ(fvallen, 4);
+        ASSERT(memcmp(fval, "val2", 4) == 0); /* old value */
+    }
+
+    /* MVCC cursor should also iterate with old key cases */
+    {
+        struct twom_cursor *cur = NULL;
+        const char *key, *val;
+        size_t keylen, vallen;
+
+        r = twom_txn_begin_cursor(mvcc_txn, NULL, 0, &cur, 0);
+        ASSERT_OK(r);
+
+        r = twom_cursor_next(cur, &key, &keylen, &val, &vallen);
+        ASSERT_OK(r);
+        ASSERT_EQ(keylen, 5);
+        ASSERT(memcmp(key, "APPLE", 5) == 0); /* was already APPLE at snapshot */
+
+        r = twom_cursor_next(cur, &key, &keylen, &val, &vallen);
+        ASSERT_OK(r);
+        ASSERT_EQ(keylen, 6);
+        ASSERT(memcmp(key, "banana", 6) == 0); /* old case */
+        ASSERT(memcmp(val, "fruit_b", 7) == 0);
+
+        r = twom_cursor_next(cur, &key, &keylen, &val, &vallen);
+        ASSERT_OK(r);
+        ASSERT_EQ(keylen, 5);
+        ASSERT(memcmp(key, "HELLO", 5) == 0); /* old case */
+        ASSERT(memcmp(val, "val2", 4) == 0);
+
+        r = twom_cursor_next(cur, &key, &keylen, &val, &vallen);
+        ASSERT_EQ(r, TWOM_DONE);
+
+        twom_cursor_fini(&cur);
+    }
+
+    r = twom_txn_abort(&mvcc_txn);
+    ASSERT_OK(r);
+
+    ISCONSISTENT();
+
+    /* --- delete with different case --- */
+    CANDELETE("apple", 5); /* delete "APPLE" via lowercase lookup */
+    CANCOMMIT();
+    CANNOTFETCH_NOTXN("APPLE", 5, TWOM_NOTFOUND);
+    CANNOTFETCH_NOTXN("apple", 5, TWOM_NOTFOUND);
+    ASSERT_EQ(twom_db_num_records(db), 2);
+    ISCONSISTENT();
+
+    /* --- repack preserves case-insensitive ordering --- */
+    r = twom_db_repack(db);
+    ASSERT_OK(r);
+    ISCONSISTENT();
+
+    /* verify records survived repack */
+    {
+        const char *fkey, *fval;
+        size_t fkeylen, fvallen;
+
+        r = twom_db_fetch(db, "banana", 6, &fkey, &fkeylen,
+                          &fval, &fvallen, 0);
+        ASSERT_OK(r);
+        ASSERT(memcmp(fkey, "BANANA", 6) == 0);
+        ASSERT(memcmp(fval, "fruit_4", 7) == 0);
+
+        r = twom_db_fetch(db, "hello", 5, &fkey, &fkeylen,
+                          &fval, &fvallen, 0);
+        ASSERT_OK(r);
+        ASSERT(memcmp(fkey, "Hello", 5) == 0);
+        ASSERT(memcmp(fval, "val3", 4) == 0);
+    }
+
+    ASSERT_EQ(twom_db_num_records(db), 2);
+
+    /* iteration after repack */
+    {
+        struct twom_cursor *cur = NULL;
+        const char *key, *val;
+        size_t keylen, vallen;
+
+        r = twom_db_begin_cursor(db, NULL, 0, &cur, TWOM_SHARED);
+        ASSERT_OK(r);
+
+        r = twom_cursor_next(cur, &key, &keylen, &val, &vallen);
+        ASSERT_OK(r);
+        ASSERT_EQ(keylen, 6);
+        ASSERT(memcmp(key, "BANANA", 6) == 0);
+
+        r = twom_cursor_next(cur, &key, &keylen, &val, &vallen);
+        ASSERT_OK(r);
+        ASSERT_EQ(keylen, 5);
+        ASSERT(memcmp(key, "Hello", 5) == 0);
+
+        r = twom_cursor_next(cur, &key, &keylen, &val, &vallen);
+        ASSERT_EQ(r, TWOM_DONE);
+
+        r = twom_cursor_abort(&cur);
+        ASSERT_OK(r);
+    }
+
+    /* --- close and reopen with same compar --- */
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    CANFETCH_NOTXN("banana", 6, "fruit_4", 7);
+    CANFETCH_NOTXN("hello", 5, "val3", 4);
+    ISCONSISTENT();
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+}
+
+/*
+ * ============================================================
  * Test runner
  * ============================================================
  */
@@ -3565,6 +4035,8 @@ static struct test_entry tests[] = {
     { "test_open_with_txn",      test_open_with_txn },
     { "test_foreach_goodp",      test_foreach_goodp },
     { "test_error_cases",        test_error_cases },
+    { "test_compar_reverse",     test_compar_reverse },
+    { "test_compar_caseless",    test_compar_caseless },
     { NULL, NULL }
 };
 

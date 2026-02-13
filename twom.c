@@ -378,6 +378,11 @@ static int compar_raw(const char *s1, size_t l1, const char *s2, size_t l2)
     return 0;
 }
 
+/* Wrap the comparator so that the zero-length string (DUMMY sentinel key)
+ * always sorts first, regardless of what an external comparator does. */
+#define COMPAR(fn, a, al, b, bl) \
+    (!(al) ? (!(bl) ? 0 : -1) : (!(bl) ? 1 : (fn)((a), (al), (b), (bl))))
+
 /************** CHECKSUMS ****************/
 
 #ifdef HAVE_DECLARE_OPTIMIZE
@@ -794,8 +799,8 @@ static int locate(struct twom_txn *txn, struct tm_loc *loc, const char *key, siz
             ptr = safeptr(loc, next);
             if (!ptr) return TWOM_IOERROR;
 
-            cmp = file->compar(KEYPTR(ptr), KEYLEN(ptr),
-                               key, keylen);
+            cmp = COMPAR(file->compar, KEYPTR(ptr), KEYLEN(ptr),
+                         key, keylen);
 
             /* not there?  stay at this level */
             if (cmp < 0) {
@@ -832,8 +837,8 @@ static int locate(struct twom_txn *txn, struct tm_loc *loc, const char *key, siz
             if (!ptr) return TWOM_IOERROR;
         }
 
-        cmp = file->compar(KEYPTR(ptr), KEYLEN(ptr),
-                           key, keylen);
+        cmp = COMPAR(file->compar, KEYPTR(ptr), KEYLEN(ptr),
+                     key, keylen);
 
         // if we match exactly or see into the future, we're there!
         if (cmp > 0) {
@@ -959,7 +964,7 @@ static int find_loc(struct twom_txn *txn, struct tm_loc *loc, const char *key, s
     }
 
     const char *ptr = loc->offset ? LOCPTR(loc) : LOCBACKPTR(loc, 0);
-    int cmp = loc->file->compar(KEYPTR(ptr), KEYLEN(ptr), key, keylen);
+    int cmp = COMPAR(loc->file->compar, KEYPTR(ptr), KEYLEN(ptr), key, keylen);
     if (!cmp && loc->offset) {
         // we haven't moved
         return 0;
@@ -990,7 +995,7 @@ static int find_loc(struct twom_txn *txn, struct tm_loc *loc, const char *key, s
             ptr = safeptr(loc, offset);
             if (!ptr) return TWOM_IOERROR;
         }
-        cmp = loc->file->compar(KEYPTR(ptr), KEYLEN(ptr), key, keylen);
+        cmp = COMPAR(loc->file->compar, KEYPTR(ptr), KEYLEN(ptr), key, keylen);
         // it's in the gap?
         if (cmp > 0) return 0;
         // found it?
@@ -1321,8 +1326,8 @@ static int recovery1(struct twom_db *db, struct tm_loc *loc, int *count)
             if (!nextptr) return TWOM_IOERROR;
         }
 
-        cmp = file->compar(KEYPTR(nextptr), KEYLEN(nextptr),
-                           KEYPTR(ptr), KEYLEN(ptr));
+        cmp = COMPAR(file->compar, KEYPTR(nextptr), KEYLEN(nextptr),
+                     KEYPTR(ptr), KEYLEN(ptr));
         if (cmp <= 0) {
             db->error("out of order for recovery",
                       "fname=<%s> prev_key=<%.*s> key=<%.*s> offset=<%08llX>",
@@ -1350,8 +1355,8 @@ static int recovery1(struct twom_db *db, struct tm_loc *loc, int *count)
                 aptr = safeptr(loc, ancestor);
                 if (!aptr) return TWOM_IOERROR;
             }
-            cmp = file->compar(KEYPTR(aptr), KEYLEN(aptr),
-                               KEYPTR(nextptr), KEYLEN(nextptr));
+            cmp = COMPAR(file->compar, KEYPTR(aptr), KEYLEN(aptr),
+                         KEYPTR(nextptr), KEYLEN(nextptr));
             if (cmp) {
                 db->error("twom mismatched ancestor for recovery",
                         "fname=<%s> key=<%.*s> offset=<%08llX>"
@@ -1894,8 +1899,9 @@ static int initdb(struct twom_db *db, int flags)
     // prepare the header
     uuid_generate(header.uuid);
     header.version = TWOM_VERSION;
-    // XXX: other persistent flags?
     header.flags = set_csum_engine(db, file, flags);
+    if (flags & TWOM_COMPAR_EXTERNAL)
+        header.flags |= TWOM_COMPAR_EXTERNAL;
     header.generation = 1;
     header.num_records = 0;
     header.num_commits = 0;
@@ -2202,7 +2208,7 @@ static int skipwrite(struct twom_txn *txn,
         if (flags & TWOM_IFNOTEXIST) return TWOM_EXISTS;
         if (!data) return store_here(txn, key, keylen, NULL, 0);
         /* unchanged?  Save the IO */
-        if (!loc->file->compar(data, datalen, VALPTR(ptr), VALLEN(ptr)))
+        if (!COMPAR(loc->file->compar, data, datalen, VALPTR(ptr), VALLEN(ptr)))
             return 0;
         return store_here(txn, key, keylen, data, datalen);
     }
@@ -2354,8 +2360,8 @@ static int consistent1(struct twom_txn *txn, struct tm_loc *loc)
             if (!nextptr) return TWOM_IOERROR;
         }
 
-        cmp = file->compar(KEYPTR(nextptr), KEYLEN(nextptr),
-                           KEYPTR(ptr), KEYLEN(ptr));
+        cmp = COMPAR(file->compar, KEYPTR(nextptr), KEYLEN(nextptr),
+                     KEYPTR(ptr), KEYLEN(ptr));
         if (cmp <= 0) {
             db->error("out of order for consistent",
                       "fname=<%s> key=<%.*s> offset=<%08llX> prev_key=<%.*s>",
@@ -2381,8 +2387,8 @@ static int consistent1(struct twom_txn *txn, struct tm_loc *loc)
                 aptr = safeptr(loc, ancestor);
                 if (!aptr) return TWOM_IOERROR;
             }
-            cmp = file->compar(KEYPTR(aptr), KEYLEN(aptr),
-                               KEYPTR(nextptr), KEYLEN(nextptr));
+            cmp = COMPAR(file->compar, KEYPTR(aptr), KEYLEN(aptr),
+                         KEYPTR(nextptr), KEYLEN(nextptr));
             if (cmp) {
                 db->error("mismatched ancestor for consistent",
                           "fname=<%s> key=<%.*s> offset=<%08llX>"
@@ -2734,7 +2740,7 @@ int twom_cursor_next(struct twom_cursor *cur,
         size_t keylen = KEYLEN(this);
         if (keylen < cur->prefixlen) return TWOM_DONE;
         const char *key = KEYPTR(this);
-        if (txn->file->compar(key, cur->prefixlen, cur->prefix, cur->prefixlen))
+        if (COMPAR(txn->file->compar, key, cur->prefixlen, cur->prefix, cur->prefixlen))
             return TWOM_DONE;
     }
 
@@ -2783,7 +2789,7 @@ int twom_cursor_replace(struct twom_cursor *cur,
         if (flags & TWOM_IFNOTEXIST) return TWOM_EXISTS;
         if (!data) return store_here(cur->txn, key, keylen, NULL, 0);
         /* unchanged?  Save the IO */
-        if (!cur->loc.file->compar(data, datalen, VALPTR(ptr), VALLEN(ptr)))
+        if (!COMPAR(cur->loc.file->compar, data, datalen, VALPTR(ptr), VALLEN(ptr)))
             return 0;
         return store_here(cur->txn, key, keylen, data, datalen);
     }
