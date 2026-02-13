@@ -2674,7 +2674,7 @@ int twom_db_begin_cursor(struct twom_db *db,
                          struct twom_cursor **curp, int flags)
 {
     struct twom_txn *txn = NULL;
-    int r = twom_db_begin_txn(db, flags & TWOM_SHARED, &txn);
+    int r = twom_db_begin_txn(db, flags, &txn);
     if (r) return r;
     r = twom_txn_begin_cursor(txn, prefix, prefixlen, curp, flags);
     if (r) {
@@ -2771,6 +2771,11 @@ int twom_cursor_replace(struct twom_cursor *cur,
     const char *ptr = LOCPTR(&cur->loc);
     const char *key = KEYPTR(ptr);
     size_t keylen = KEYLEN(ptr);
+
+    /* position db->loc at the key so store_here can rewire skip pointers */
+    int r = find_loc(cur->txn, &cur->txn->db->loc, key, keylen);
+    if (r) return r;
+
     /* could be a delete or a replace */
     if (hastail[TYPE(ptr)]) {
         // replacing existing record

@@ -13,6 +13,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "twom.h"
@@ -179,6 +180,26 @@ static void ht_free(struct hash_table *ht, void (*free_fn)(void *))
     free(ht->buckets);
     ht->buckets = NULL;
     ht->count = 0;
+}
+
+/*
+ * ============================================================
+ * Multi-process synchronization helpers
+ * ============================================================
+ */
+
+static void signal_peer(int fd)
+{
+    char c = 'X';
+    ssize_t n = write(fd, &c, 1);
+    assert(n == 1);
+}
+
+static void wait_for_peer(int fd)
+{
+    char c;
+    ssize_t n = read(fd, &c, 1);
+    assert(n == 1);
 }
 
 /*
@@ -2079,6 +2100,646 @@ static void test_foreach_replace(void)
 
 /*
  * ============================================================
+ * Cursor tests
+ * ============================================================
+ */
+
+static void test_cursor_basic(void)
+{
+    struct twom_db *db = NULL;
+    struct twom_txn *txn = NULL;
+    struct twom_cursor *cur = NULL;
+    int r;
+
+    struct twom_open_data init = TWOM_OPEN_DATA_INITIALIZER;
+    init.flags = TWOM_CREATE;
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    /* store 5 sorted records */
+    CANSTORE("apple", 5, "val_a", 5);
+    CANSTORE("banana", 6, "val_b", 5);
+    CANSTORE("cherry", 6, "val_c", 5);
+    CANSTORE("cranberry", 9, "val_cr", 6);
+    CANSTORE("date", 4, "val_d", 5);
+    CANCOMMIT();
+    CANREOPEN();
+
+    /* full iteration */
+    r = twom_db_begin_cursor(db, NULL, 0, &cur, 0);
+    ASSERT_OK(r);
+    ASSERT_NOT_NULL(cur);
+
+    const char *key, *val;
+    size_t keylen, vallen;
+
+    r = twom_cursor_next(cur, &key, &keylen, &val, &vallen);
+    ASSERT_OK(r);
+    ASSERT_EQ(keylen, 5); ASSERT(memcmp(key, "apple", 5) == 0);
+    ASSERT_EQ(vallen, 5); ASSERT(memcmp(val, "val_a", 5) == 0);
+
+    r = twom_cursor_next(cur, &key, &keylen, &val, &vallen);
+    ASSERT_OK(r);
+    ASSERT_EQ(keylen, 6); ASSERT(memcmp(key, "banana", 6) == 0);
+    ASSERT_EQ(vallen, 5); ASSERT(memcmp(val, "val_b", 5) == 0);
+
+    r = twom_cursor_next(cur, &key, &keylen, &val, &vallen);
+    ASSERT_OK(r);
+    ASSERT_EQ(keylen, 6); ASSERT(memcmp(key, "cherry", 6) == 0);
+    ASSERT_EQ(vallen, 5); ASSERT(memcmp(val, "val_c", 5) == 0);
+
+    r = twom_cursor_next(cur, &key, &keylen, &val, &vallen);
+    ASSERT_OK(r);
+    ASSERT_EQ(keylen, 9); ASSERT(memcmp(key, "cranberry", 9) == 0);
+    ASSERT_EQ(vallen, 6); ASSERT(memcmp(val, "val_cr", 6) == 0);
+
+    r = twom_cursor_next(cur, &key, &keylen, &val, &vallen);
+    ASSERT_OK(r);
+    ASSERT_EQ(keylen, 4); ASSERT(memcmp(key, "date", 4) == 0);
+    ASSERT_EQ(vallen, 5); ASSERT(memcmp(val, "val_d", 5) == 0);
+
+    r = twom_cursor_next(cur, &key, &keylen, &val, &vallen);
+    ASSERT_EQ(r, TWOM_DONE);
+
+    r = twom_cursor_abort(&cur);
+    ASSERT_OK(r);
+
+    /* TWOM_CURSOR_PREFIX: only keys starting with "c" */
+    r = twom_db_begin_cursor(db, "c", 1, &cur, TWOM_CURSOR_PREFIX);
+    ASSERT_OK(r);
+
+    r = twom_cursor_next(cur, &key, &keylen, &val, &vallen);
+    ASSERT_OK(r);
+    ASSERT_EQ(keylen, 6); ASSERT(memcmp(key, "cherry", 6) == 0);
+
+    r = twom_cursor_next(cur, &key, &keylen, &val, &vallen);
+    ASSERT_OK(r);
+    ASSERT_EQ(keylen, 9); ASSERT(memcmp(key, "cranberry", 9) == 0);
+
+    r = twom_cursor_next(cur, &key, &keylen, &val, &vallen);
+    ASSERT_EQ(r, TWOM_DONE);
+
+    r = twom_cursor_abort(&cur);
+    ASSERT_OK(r);
+
+    /* TWOM_SKIPROOT: start at "cherry" but skip it */
+    r = twom_db_begin_cursor(db, "cherry", 6, &cur, TWOM_SKIPROOT);
+    ASSERT_OK(r);
+
+    r = twom_cursor_next(cur, &key, &keylen, &val, &vallen);
+    ASSERT_OK(r);
+    ASSERT_EQ(keylen, 9); ASSERT(memcmp(key, "cranberry", 9) == 0);
+
+    r = twom_cursor_abort(&cur);
+    ASSERT_OK(r);
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+}
+
+static void test_cursor_replace(void)
+{
+    struct twom_db *db = NULL;
+    struct twom_txn *txn = NULL;
+    struct twom_cursor *cur = NULL;
+    int r;
+
+    struct twom_open_data init = TWOM_OPEN_DATA_INITIALIZER;
+    init.flags = TWOM_CREATE;
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    /* store 3 records */
+    CANSTORE("alpha", 5, "old_a", 5);
+    CANSTORE("beta", 4, "old_b", 5);
+    CANSTORE("gamma", 5, "old_g", 5);
+    CANCOMMIT();
+    CANREOPEN();
+
+    /* open write cursor (no TWOM_SHARED) */
+    r = twom_db_begin_cursor(db, NULL, 0, &cur, 0);
+    ASSERT_OK(r);
+
+    const char *key, *val;
+    size_t keylen, vallen;
+
+    /* first record: alpha */
+    r = twom_cursor_next(cur, &key, &keylen, &val, &vallen);
+    ASSERT_OK(r);
+    ASSERT_EQ(keylen, 5); ASSERT(memcmp(key, "alpha", 5) == 0);
+
+    /* second record: beta - replace it */
+    r = twom_cursor_next(cur, &key, &keylen, &val, &vallen);
+    ASSERT_OK(r);
+    ASSERT_EQ(keylen, 4); ASSERT(memcmp(key, "beta", 4) == 0);
+    ASSERT_EQ(vallen, 5); ASSERT(memcmp(val, "old_b", 5) == 0);
+
+    r = twom_cursor_replace(cur, "new_b", 5, 0);
+    ASSERT_OK(r);
+
+    /* third record: gamma - unchanged */
+    r = twom_cursor_next(cur, &key, &keylen, &val, &vallen);
+    ASSERT_OK(r);
+    ASSERT_EQ(keylen, 5); ASSERT(memcmp(key, "gamma", 5) == 0);
+    ASSERT_EQ(vallen, 5); ASSERT(memcmp(val, "old_g", 5) == 0);
+
+    r = twom_cursor_next(cur, &key, &keylen, &val, &vallen);
+    ASSERT_EQ(r, TWOM_DONE);
+
+    /* commit the cursor */
+    r = twom_cursor_commit(&cur);
+    ASSERT_OK(r);
+
+    /* reopen and verify */
+    CANREOPEN();
+
+    CANFETCH("alpha", 5, "old_a", 5);
+    CANFETCH("beta", 4, "new_b", 5);
+    CANFETCH("gamma", 5, "old_g", 5);
+    CANCOMMIT();
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+}
+
+static void test_cursor_txn(void)
+{
+    struct twom_db *db = NULL;
+    struct twom_txn *txn = NULL;
+    struct twom_cursor *cur = NULL;
+    int r;
+
+    struct twom_open_data init = TWOM_OPEN_DATA_INITIALIZER;
+    init.flags = TWOM_CREATE;
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    /* begin write txn and store records */
+    r = twom_db_begin_txn(db, 0, &txn);
+    ASSERT_OK(r);
+
+    r = twom_txn_store(txn, "one", 3, "val_1", 5, 0);
+    ASSERT_OK(r);
+    r = twom_txn_store(txn, "two", 3, "val_2", 5, 0);
+    ASSERT_OK(r);
+    r = twom_txn_store(txn, "three", 5, "val_3", 5, 0);
+    ASSERT_OK(r);
+
+    /* cursor inside the transaction sees uncommitted data */
+    r = twom_txn_begin_cursor(txn, NULL, 0, &cur, 0);
+    ASSERT_OK(r);
+
+    const char *key, *val;
+    size_t keylen, vallen;
+    int count = 0;
+
+    while ((r = twom_cursor_next(cur, &key, &keylen, &val, &vallen)) == TWOM_OK) {
+        count++;
+    }
+    ASSERT_EQ(r, TWOM_DONE);
+    ASSERT_EQ(count, 3);
+
+    /* fini cursor only, txn still alive */
+    twom_cursor_fini(&cur);
+    ASSERT_NULL(cur);
+
+    /* commit the txn */
+    r = twom_txn_commit(&txn);
+    ASSERT_OK(r);
+
+    /* reopen and verify records persisted */
+    CANREOPEN();
+
+    CANFETCH("one", 3, "val_1", 5);
+    CANFETCH("two", 3, "val_2", 5);
+    CANFETCH("three", 5, "val_3", 5);
+    CANCOMMIT();
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+}
+
+/*
+ * ============================================================
+ * MVCC tests (multi-process)
+ * ============================================================
+ */
+
+static void test_mvcc_write_while_reading(void)
+{
+    struct twom_db *db = NULL;
+    struct twom_txn *txn = NULL;
+    struct twom_cursor *cur = NULL;
+    int r;
+
+    /* populate database */
+    struct twom_open_data init = TWOM_OPEN_DATA_INITIALIZER;
+    init.flags = TWOM_CREATE;
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    CANSTORE("apple", 5, "old_a", 5);
+    CANSTORE("banana", 6, "old_b", 5);
+    CANSTORE("cherry", 6, "old_c", 5);
+    CANCOMMIT();
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+    db = NULL;
+
+    /* set up pipes for synchronization */
+    int p2c[2], c2p[2];
+    r = pipe(p2c);
+    ASSERT_EQ(r, 0);
+    r = pipe(c2p);
+    ASSERT_EQ(r, 0);
+
+    pid_t pid = fork();
+    ASSERT(pid >= 0);
+
+    if (pid == 0) {
+        /* === CHILD === */
+        close(p2c[1]); /* close write end of parent-to-child */
+        close(c2p[0]); /* close read end of child-to-parent */
+
+        /* wait for parent to open MVCC cursor */
+        wait_for_peer(p2c[0]);
+
+        /* open db and write a new value for banana */
+        struct twom_open_data cinit = TWOM_OPEN_DATA_INITIALIZER;
+        struct twom_db *cdb = NULL;
+        struct twom_txn *ctxn = NULL;
+
+        int cr = twom_db_open(filename, &cinit, &cdb, NULL);
+        assert(cr == TWOM_OK);
+
+        cr = twom_db_begin_txn(cdb, 0, &ctxn);
+        assert(cr == TWOM_OK);
+
+        cr = twom_txn_store(ctxn, "banana", 6, "new_b", 5, 0);
+        assert(cr == TWOM_OK);
+
+        cr = twom_txn_commit(&ctxn);
+        assert(cr == TWOM_OK);
+
+        cr = twom_db_close(&cdb);
+        assert(cr == TWOM_OK);
+
+        /* signal parent that write is done */
+        signal_peer(c2p[1]);
+
+        /* wait for parent to finish reading */
+        wait_for_peer(p2c[0]);
+
+        close(p2c[0]);
+        close(c2p[1]);
+        _exit(0);
+    }
+
+    /* === PARENT === */
+    close(p2c[0]); /* close read end of parent-to-child */
+    close(c2p[1]); /* close write end of child-to-parent */
+
+    /* open db and begin MVCC cursor (shared so child can write) */
+    init.flags = 0;
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    r = twom_db_begin_cursor(db, NULL, 0, &cur, TWOM_SHARED | TWOM_MVCC);
+    ASSERT_OK(r);
+
+    /* yield lock so child can acquire write lock */
+    r = twom_db_yield(db);
+    ASSERT_OK(r);
+
+    /* signal child to do its write */
+    signal_peer(p2c[1]);
+
+    /* wait for child to finish writing */
+    wait_for_peer(c2p[0]);
+
+    /* iterate cursor - must see the OLD value of banana */
+    const char *key, *val;
+    size_t keylen, vallen;
+    int saw_banana = 0;
+
+    while ((r = twom_cursor_next(cur, &key, &keylen, &val, &vallen)) == TWOM_OK) {
+        if (keylen == 6 && memcmp(key, "banana", 6) == 0) {
+            saw_banana = 1;
+            ASSERT_EQ(vallen, 5);
+            ASSERT(memcmp(val, "old_b", 5) == 0);
+        }
+    }
+    ASSERT_EQ(r, TWOM_DONE);
+    ASSERT(saw_banana);
+
+    r = twom_cursor_abort(&cur);
+    ASSERT_OK(r);
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+
+    /* signal child it can exit */
+    signal_peer(p2c[1]);
+
+    /* wait for child and check exit status */
+    int status;
+    waitpid(pid, &status, 0);
+    ASSERT(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+
+    close(p2c[1]);
+    close(c2p[0]);
+
+    /* verify write actually happened by reopening without MVCC */
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    const char *data;
+    size_t datalen;
+    r = twom_db_fetch(db, "banana", 6, NULL, NULL, &data, &datalen, 0);
+    ASSERT_OK(r);
+    ASSERT_EQ(datalen, 5);
+    ASSERT(memcmp(data, "new_b", 5) == 0);
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+}
+
+static void test_mvcc_delete_while_reading(void)
+{
+    struct twom_db *db = NULL;
+    struct twom_txn *txn = NULL;
+    struct twom_cursor *cur = NULL;
+    int r;
+
+    /* populate database */
+    struct twom_open_data init = TWOM_OPEN_DATA_INITIALIZER;
+    init.flags = TWOM_CREATE;
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    CANSTORE("apple", 5, "val_a", 5);
+    CANSTORE("banana", 6, "val_b", 5);
+    CANSTORE("cherry", 6, "val_c", 5);
+    CANCOMMIT();
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+    db = NULL;
+
+    /* set up pipes */
+    int p2c[2], c2p[2];
+    r = pipe(p2c);
+    ASSERT_EQ(r, 0);
+    r = pipe(c2p);
+    ASSERT_EQ(r, 0);
+
+    pid_t pid = fork();
+    ASSERT(pid >= 0);
+
+    if (pid == 0) {
+        /* === CHILD === */
+        close(p2c[1]);
+        close(c2p[0]);
+
+        wait_for_peer(p2c[0]);
+
+        /* delete banana */
+        struct twom_open_data cinit = TWOM_OPEN_DATA_INITIALIZER;
+        struct twom_db *cdb = NULL;
+        struct twom_txn *ctxn = NULL;
+
+        int cr = twom_db_open(filename, &cinit, &cdb, NULL);
+        assert(cr == TWOM_OK);
+
+        cr = twom_db_begin_txn(cdb, 0, &ctxn);
+        assert(cr == TWOM_OK);
+
+        cr = twom_txn_store(ctxn, "banana", 6, NULL, 0, 0);
+        assert(cr == TWOM_OK);
+
+        cr = twom_txn_commit(&ctxn);
+        assert(cr == TWOM_OK);
+
+        cr = twom_db_close(&cdb);
+        assert(cr == TWOM_OK);
+
+        signal_peer(c2p[1]);
+        wait_for_peer(p2c[0]);
+
+        close(p2c[0]);
+        close(c2p[1]);
+        _exit(0);
+    }
+
+    /* === PARENT === */
+    close(p2c[0]);
+    close(c2p[1]);
+
+    /* open db and begin MVCC cursor (shared so child can write) */
+    init.flags = 0;
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    r = twom_db_begin_cursor(db, NULL, 0, &cur, TWOM_SHARED | TWOM_MVCC);
+    ASSERT_OK(r);
+
+    /* yield lock so child can acquire write lock */
+    r = twom_db_yield(db);
+    ASSERT_OK(r);
+
+    /* signal child to delete banana */
+    signal_peer(p2c[1]);
+    wait_for_peer(c2p[0]);
+
+    /* iterate cursor - must STILL see banana (snapshot isolation) */
+    const char *key, *val;
+    size_t keylen, vallen;
+    int saw_banana = 0;
+    int count = 0;
+
+    while ((r = twom_cursor_next(cur, &key, &keylen, &val, &vallen)) == TWOM_OK) {
+        count++;
+        if (keylen == 6 && memcmp(key, "banana", 6) == 0) {
+            saw_banana = 1;
+            ASSERT_EQ(vallen, 5);
+            ASSERT(memcmp(val, "val_b", 5) == 0);
+        }
+    }
+    ASSERT_EQ(r, TWOM_DONE);
+    ASSERT_EQ(count, 3);
+    ASSERT(saw_banana);
+
+    r = twom_cursor_abort(&cur);
+    ASSERT_OK(r);
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+
+    signal_peer(p2c[1]);
+
+    int status;
+    waitpid(pid, &status, 0);
+    ASSERT(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+
+    close(p2c[1]);
+    close(c2p[0]);
+
+    /* verify delete actually happened */
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    const char *data;
+    size_t datalen;
+    r = twom_db_fetch(db, "banana", 6, NULL, NULL, &data, &datalen, 0);
+    ASSERT_EQ(r, TWOM_NOTFOUND);
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+}
+
+static void test_mvcc_create_delete_invisible(void)
+{
+    struct twom_db *db = NULL;
+    struct twom_txn *txn = NULL;
+    struct twom_cursor *cur = NULL;
+    int r;
+
+    /* populate database with apple and cherry only (no banana) */
+    struct twom_open_data init = TWOM_OPEN_DATA_INITIALIZER;
+    init.flags = TWOM_CREATE;
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    CANSTORE("apple", 5, "val_a", 5);
+    CANSTORE("cherry", 6, "val_c", 5);
+    CANCOMMIT();
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+    db = NULL;
+
+    /* set up pipes */
+    int p2c[2], c2p[2];
+    r = pipe(p2c);
+    ASSERT_EQ(r, 0);
+    r = pipe(c2p);
+    ASSERT_EQ(r, 0);
+
+    pid_t pid = fork();
+    ASSERT(pid >= 0);
+
+    if (pid == 0) {
+        /* === CHILD === */
+        close(p2c[1]);
+        close(c2p[0]);
+
+        wait_for_peer(p2c[0]);
+
+        /* create banana, then delete it */
+        struct twom_open_data cinit = TWOM_OPEN_DATA_INITIALIZER;
+        struct twom_db *cdb = NULL;
+        struct twom_txn *ctxn = NULL;
+
+        int cr = twom_db_open(filename, &cinit, &cdb, NULL);
+        assert(cr == TWOM_OK);
+
+        /* first txn: create banana */
+        cr = twom_db_begin_txn(cdb, 0, &ctxn);
+        assert(cr == TWOM_OK);
+        cr = twom_txn_store(ctxn, "banana", 6, "val_b", 5, 0);
+        assert(cr == TWOM_OK);
+        cr = twom_txn_commit(&ctxn);
+        assert(cr == TWOM_OK);
+
+        /* second txn: delete banana */
+        cr = twom_db_begin_txn(cdb, 0, &ctxn);
+        assert(cr == TWOM_OK);
+        cr = twom_txn_store(ctxn, "banana", 6, NULL, 0, 0);
+        assert(cr == TWOM_OK);
+        cr = twom_txn_commit(&ctxn);
+        assert(cr == TWOM_OK);
+
+        cr = twom_db_close(&cdb);
+        assert(cr == TWOM_OK);
+
+        signal_peer(c2p[1]);
+        wait_for_peer(p2c[0]);
+
+        close(p2c[0]);
+        close(c2p[1]);
+        _exit(0);
+    }
+
+    /* === PARENT === */
+    close(p2c[0]);
+    close(c2p[1]);
+
+    /* open db and begin MVCC cursor (shared so child can write) */
+    init.flags = 0;
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    r = twom_db_begin_cursor(db, NULL, 0, &cur, TWOM_SHARED | TWOM_MVCC);
+    ASSERT_OK(r);
+
+    /* yield lock so child can acquire write lock */
+    r = twom_db_yield(db);
+    ASSERT_OK(r);
+
+    /* signal child to create+delete banana */
+    signal_peer(p2c[1]);
+    wait_for_peer(c2p[0]);
+
+    /* iterate cursor - must NOT see banana */
+    const char *key, *val;
+    size_t keylen, vallen;
+    int saw_banana = 0;
+    int count = 0;
+
+    while ((r = twom_cursor_next(cur, &key, &keylen, &val, &vallen)) == TWOM_OK) {
+        count++;
+        if (keylen == 6 && memcmp(key, "banana", 6) == 0) {
+            saw_banana = 1;
+        }
+    }
+    ASSERT_EQ(r, TWOM_DONE);
+    ASSERT_EQ(count, 2);  /* only apple and cherry */
+    ASSERT(!saw_banana);
+
+    r = twom_cursor_abort(&cur);
+    ASSERT_OK(r);
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+
+    signal_peer(p2c[1]);
+
+    int status;
+    waitpid(pid, &status, 0);
+    ASSERT(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+
+    close(p2c[1]);
+    close(c2p[0]);
+
+    /* also verify banana is gone via fetch */
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    const char *data;
+    size_t datalen;
+    r = twom_db_fetch(db, "banana", 6, NULL, NULL, &data, &datalen, 0);
+    ASSERT_EQ(r, TWOM_NOTFOUND);
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+}
+
+/*
+ * ============================================================
  * Test runner
  * ============================================================
  */
@@ -2108,6 +2769,12 @@ static struct test_entry tests[] = {
     { "test_binary_data",        test_binary_data },
     { "test_many",               test_many },
     { "test_foreach_replace",    test_foreach_replace },
+    { "test_cursor_basic",       test_cursor_basic },
+    { "test_cursor_replace",     test_cursor_replace },
+    { "test_cursor_txn",         test_cursor_txn },
+    { "test_mvcc_write_while_reading",      test_mvcc_write_while_reading },
+    { "test_mvcc_delete_while_reading",     test_mvcc_delete_while_reading },
+    { "test_mvcc_create_delete_invisible",  test_mvcc_create_delete_invisible },
     { NULL, NULL }
 };
 
