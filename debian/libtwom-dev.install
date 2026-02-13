@@ -1,0 +1,4 @@
+usr/lib/*/libtwom.a
+usr/lib/*/libtwom.so
+usr/lib/*/pkgconfig/twom.pc
+usr/include/twom.h

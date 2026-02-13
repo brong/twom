@@ -1,0 +1,19 @@
+#!/usr/bin/make -f
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+DEB_HOST_MULTIARCH ?= $(shell dpkg-architecture -qDEB_HOST_MULTIARCH)
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	$(MAKE) PREFIX=/usr LIBDIR=/usr/lib/$(DEB_HOST_MULTIARCH)
+
+override_dh_auto_test:
+	$(MAKE) check
+
+override_dh_auto_install:
+	$(MAKE) PREFIX=/usr LIBDIR=/usr/lib/$(DEB_HOST_MULTIARCH) DESTDIR=debian/tmp install
+
+override_dh_auto_clean:
+	$(MAKE) clean

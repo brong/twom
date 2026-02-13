@@ -1,0 +1,48 @@
+Source: twom
+Section: libs
+Priority: optional
+Maintainer: Bron Gondwana <brong@fastmailteam.com>
+Build-Depends: debhelper-compat (= 13), uuid-dev, pkg-config
+Standards-Version: 4.6.2
+Homepage: https://github.com/brong/twom
+Rules-Requires-Root: no
+
+Package: libtwom0
+Architecture: any
+Multi-Arch: same
+Section: libs
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: skiplist key-value store with MVCC - shared library
+ twom is a file-backed ordered key-value database providing sorted key
+ iteration, transactions with commit/abort, MVCC for serializable
+ isolation, cursors, binary keys and values, checksummed records,
+ crash recovery, and compaction.
+ .
+ This package contains the shared library.
+
+Package: libtwom-dev
+Architecture: any
+Multi-Arch: same
+Section: libdevel
+Depends: libtwom0 (= ${binary:Version}), uuid-dev, ${misc:Depends}
+Description: skiplist key-value store with MVCC - development files
+ twom is a file-backed ordered key-value database providing sorted key
+ iteration, transactions with commit/abort, MVCC for serializable
+ isolation, cursors, binary keys and values, checksummed records,
+ crash recovery, and compaction.
+ .
+ This package contains the static library, header file, and
+ pkg-config file needed for development.
+
+Package: twom-tools
+Architecture: any
+Section: utils
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: skiplist key-value store with MVCC - command-line tools
+ twom is a file-backed ordered key-value database providing sorted key
+ iteration, transactions with commit/abort, MVCC for serializable
+ isolation, cursors, binary keys and values, checksummed records,
+ crash recovery, and compaction.
+ .
+ This package contains twomtool, a command-line utility for
+ inspecting and manipulating twom databases.
