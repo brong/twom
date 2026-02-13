@@ -7,6 +7,7 @@
 
 #include <assert.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -2740,6 +2741,444 @@ static void test_mvcc_create_delete_invisible(void)
 
 /*
  * ============================================================
+ * Repack, metadata, readonly, conditional store, and misc tests
+ * ============================================================
+ */
+
+static void test_repack(void)
+{
+    struct twom_db *db = NULL;
+    struct twom_txn *txn = NULL;
+    int r;
+
+    struct twom_open_data init = TWOM_OPEN_DATA_INITIALIZER;
+    init.flags = TWOM_CREATE;
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    /* store some records */
+    CANSTORE("apple", 5, "val_a", 5);
+    CANSTORE("banana", 6, "val_b", 5);
+    CANSTORE("cherry", 6, "val_c", 5);
+    CANCOMMIT();
+
+    /* delete one to create dirty space */
+    CANDELETE("banana", 6);
+    CANCOMMIT();
+
+    /* overwrite another to create more dirty space */
+    CANSTORE("apple", 5, "new_a", 5);
+    CANCOMMIT();
+
+    size_t size_before = twom_db_size(db);
+    size_t gen_before = twom_db_generation(db);
+
+    /* repack */
+    r = twom_db_repack(db);
+    ASSERT_OK(r);
+
+    /* generation should increase after repack */
+    size_t gen_after = twom_db_generation(db);
+    ASSERT(gen_after > gen_before);
+
+    /* repacked file should be smaller (removed dirty space) */
+    size_t size_after = twom_db_size(db);
+    ASSERT(size_after < size_before);
+
+    /* check consistency */
+    ISCONSISTENT();
+
+    /* verify surviving records */
+    CANFETCH("apple", 5, "new_a", 5);
+    CANNOTFETCH("banana", 6, TWOM_NOTFOUND);
+    CANFETCH("cherry", 6, "val_c", 5);
+    CANCOMMIT();
+
+    /* verify num_records reflects actual count */
+    ASSERT_EQ(twom_db_num_records(db), 2);
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+
+    /* reopen and verify data survived */
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    CANFETCH("apple", 5, "new_a", 5);
+    CANNOTFETCH("banana", 6, TWOM_NOTFOUND);
+    CANFETCH("cherry", 6, "val_c", 5);
+    CANCOMMIT();
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+}
+
+static void test_metadata(void)
+{
+    struct twom_db *db = NULL;
+    struct twom_txn *txn = NULL;
+    int r;
+
+    struct twom_open_data init = TWOM_OPEN_DATA_INITIALIZER;
+    init.flags = TWOM_CREATE;
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    /* fname should match what we opened */
+    const char *fname = twom_db_fname(db);
+    ASSERT_NOT_NULL(fname);
+    ASSERT_STR_EQ(fname, filename);
+
+    /* uuid should be a 36-char string (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx) */
+    const char *uuid = twom_db_uuid(db);
+    ASSERT_NOT_NULL(uuid);
+    ASSERT_EQ(strlen(uuid), 36);
+    ASSERT_EQ(uuid[8], '-');
+    ASSERT_EQ(uuid[13], '-');
+
+    /* empty db should have 0 records */
+    ASSERT_EQ(twom_db_num_records(db), 0);
+
+    /* size should be positive (at least header + dummy) */
+    size_t initial_size = twom_db_size(db);
+    ASSERT(initial_size > 0);
+
+    /* generation starts at 1 for a new db */
+    size_t gen = twom_db_generation(db);
+    ASSERT_EQ(gen, 1);
+
+    /* store some records and check counts */
+    CANSTORE("one", 3, "val1", 4);
+    CANSTORE("two", 3, "val2", 4);
+    CANSTORE("three", 5, "val3", 4);
+    CANCOMMIT();
+
+    ASSERT_EQ(twom_db_num_records(db), 3);
+    ASSERT(twom_db_size(db) > initial_size);
+
+    /* delete one */
+    CANDELETE("two", 3);
+    CANCOMMIT();
+
+    ASSERT_EQ(twom_db_num_records(db), 2);
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+}
+
+static void test_readonly(void)
+{
+    struct twom_db *db = NULL;
+    struct twom_txn *txn = NULL;
+    int r;
+
+    /* first create a database with some data */
+    struct twom_open_data init = TWOM_OPEN_DATA_INITIALIZER;
+    init.flags = TWOM_CREATE;
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    CANSTORE("key1", 4, "val1", 4);
+    CANSTORE("key2", 4, "val2", 4);
+    CANCOMMIT();
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+
+    /* reopen read-only */
+    init.flags = TWOM_SHARED;
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    /* reads should work */
+    CANFETCH_NOTXN("key1", 4, "val1", 4);
+    CANFETCH_NOTXN("key2", 4, "val2", 4);
+
+    /* write transaction should fail */
+    r = twom_db_begin_txn(db, 0, &txn);
+    ASSERT_EQ(r, TWOM_LOCKED);
+
+    /* non-transactional store should also fail */
+    r = twom_db_store(db, "key3", 4, "val3", 4, 0);
+    ASSERT(r != TWOM_OK);
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+}
+
+static void test_conditional_store(void)
+{
+    struct twom_db *db = NULL;
+    struct twom_txn *txn = NULL;
+    int r;
+
+    struct twom_open_data init = TWOM_OPEN_DATA_INITIALIZER;
+    init.flags = TWOM_CREATE;
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    /* TWOM_IFNOTEXIST: store only if key doesn't exist */
+    r = twom_db_begin_txn(db, 0, &txn);
+    ASSERT_OK(r);
+
+    r = twom_txn_store(txn, "alpha", 5, "first", 5, TWOM_IFNOTEXIST);
+    ASSERT_OK(r);
+
+    /* second store with IFNOTEXIST should fail with EXISTS */
+    r = twom_txn_store(txn, "alpha", 5, "second", 6, TWOM_IFNOTEXIST);
+    ASSERT_EQ(r, TWOM_EXISTS);
+
+    CANCOMMIT();
+
+    /* verify original value stuck */
+    CANFETCH("alpha", 5, "first", 5);
+    CANCOMMIT();
+
+    /* TWOM_IFEXIST: store only if key exists */
+    r = twom_db_begin_txn(db, 0, &txn);
+    ASSERT_OK(r);
+
+    /* update existing key - should succeed */
+    r = twom_txn_store(txn, "alpha", 5, "updated", 7, TWOM_IFEXIST);
+    ASSERT_OK(r);
+
+    /* update non-existing key - should fail with NOTFOUND */
+    r = twom_txn_store(txn, "beta", 4, "value", 5, TWOM_IFEXIST);
+    ASSERT_EQ(r, TWOM_NOTFOUND);
+
+    CANCOMMIT();
+
+    /* verify update applied */
+    CANFETCH("alpha", 5, "updated", 7);
+    CANNOTFETCH("beta", 4, TWOM_NOTFOUND);
+    CANCOMMIT();
+
+    /* TWOM_IFEXIST for delete: only delete if exists */
+    r = twom_db_begin_txn(db, 0, &txn);
+    ASSERT_OK(r);
+
+    /* delete existing key with IFEXIST */
+    r = twom_txn_store(txn, "alpha", 5, NULL, 0, TWOM_IFEXIST);
+    ASSERT_OK(r);
+
+    /* delete non-existing key with IFEXIST - should fail */
+    r = twom_txn_store(txn, "gamma", 5, NULL, 0, TWOM_IFEXIST);
+    ASSERT_EQ(r, TWOM_NOTFOUND);
+
+    CANCOMMIT();
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+}
+
+static void test_nosync(void)
+{
+    struct twom_db *db = NULL;
+    struct twom_txn *txn = NULL;
+    int r;
+
+    /* open with NOSYNC - operations should work, just skip fsync */
+    struct twom_open_data init = TWOM_OPEN_DATA_INITIALIZER;
+    init.flags = TWOM_CREATE | TWOM_NOSYNC;
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    CANSTORE("key", 3, "value", 5);
+    CANCOMMIT();
+
+    CANREOPEN();
+
+    CANFETCH("key", 3, "value", 5);
+    CANCOMMIT();
+
+    ISCONSISTENT();
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+}
+
+static void test_nocheck(void)
+{
+    struct twom_db *db = NULL;
+    struct twom_txn *txn = NULL;
+    int r;
+
+    /* create a normal database first */
+    struct twom_open_data init = TWOM_OPEN_DATA_INITIALIZER;
+    init.flags = TWOM_CREATE;
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    CANSTORE("key", 3, "value", 5);
+    CANCOMMIT();
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+
+    /* reopen with NOCSUM - should skip checksum verification */
+    init.flags = TWOM_NOCSUM;
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    CANFETCH_NOTXN("key", 3, "value", 5);
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+}
+
+static void test_sync(void)
+{
+    struct twom_db *db = NULL;
+    struct twom_txn *txn = NULL;
+    int r;
+
+    struct twom_open_data init = TWOM_OPEN_DATA_INITIALIZER;
+    init.flags = TWOM_CREATE;
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    CANSTORE("key", 3, "value", 5);
+    CANCOMMIT();
+
+    /* explicit sync should succeed */
+    r = twom_db_sync(db);
+    ASSERT_OK(r);
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+}
+
+static void test_dump(void)
+{
+    struct twom_db *db = NULL;
+    struct twom_txn *txn = NULL;
+    int r;
+
+    struct twom_open_data init = TWOM_OPEN_DATA_INITIALIZER;
+    init.flags = TWOM_CREATE;
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    CANSTORE("key1", 4, "val1", 4);
+    CANSTORE("key2", 4, "val2", 4);
+    CANCOMMIT();
+
+    /* redirect stdout to /dev/null so dump output doesn't pollute test output */
+    fflush(stdout);
+    int saved_stdout = dup(STDOUT_FILENO);
+    int devnull = open("/dev/null", O_WRONLY);
+    dup2(devnull, STDOUT_FILENO);
+    close(devnull);
+
+    /* dump at detail level 0 (summary) */
+    r = twom_db_dump(db, 0);
+    ASSERT_OK(r);
+
+    /* dump at detail level 1 (verbose) */
+    r = twom_db_dump(db, 1);
+    ASSERT_OK(r);
+
+    /* restore stdout */
+    fflush(stdout);
+    dup2(saved_stdout, STDOUT_FILENO);
+    close(saved_stdout);
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+}
+
+static void test_txn_yield(void)
+{
+    struct twom_db *db = NULL;
+    struct twom_txn *txn = NULL;
+    int r;
+
+    struct twom_open_data init = TWOM_OPEN_DATA_INITIALIZER;
+    init.flags = TWOM_CREATE;
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    CANSTORE("key", 3, "value", 5);
+    CANCOMMIT();
+
+    /* begin a shared (read) transaction */
+    r = twom_db_begin_txn(db, TWOM_SHARED, &txn);
+    ASSERT_OK(r);
+
+    /* fetch before yield */
+    const char *data;
+    size_t datalen;
+    r = twom_txn_fetch(txn, "key", 3, NULL, NULL, &data, &datalen, 0);
+    ASSERT_OK(r);
+    ASSERT_EQ(datalen, 5);
+    ASSERT(memcmp(data, "value", 5) == 0);
+
+    /* yield should succeed on a read txn */
+    r = twom_txn_yield(txn);
+    ASSERT_OK(r);
+
+    /* yield on a write txn should fail */
+    struct twom_txn *wtxn = NULL;
+    r = twom_db_begin_txn(db, 0, &wtxn);
+    ASSERT_OK(r);
+    r = twom_txn_yield(wtxn);
+    ASSERT_EQ(r, TWOM_LOCKED);
+    r = twom_txn_abort(&wtxn);
+    ASSERT_OK(r);
+
+    /* fetch should still work after yield (re-acquires lock) */
+    r = twom_db_begin_txn(db, TWOM_SHARED, &txn);
+    ASSERT_OK(r);
+    r = twom_txn_fetch(txn, "key", 3, NULL, NULL, &data, &datalen, 0);
+    ASSERT_OK(r);
+    ASSERT_EQ(datalen, 5);
+    ASSERT(memcmp(data, "value", 5) == 0);
+
+    r = twom_txn_abort(&txn);
+    ASSERT_OK(r);
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+}
+
+static void test_strerror(void)
+{
+    /* verify all error codes return non-NULL distinct strings */
+    const char *s;
+
+    s = twom_strerror(TWOM_OK);
+    ASSERT_NOT_NULL(s);
+    ASSERT_STR_EQ(s, "OK");
+
+    s = twom_strerror(TWOM_DONE);
+    ASSERT_NOT_NULL(s);
+    ASSERT_STR_EQ(s, "Done");
+
+    s = twom_strerror(TWOM_IOERROR);
+    ASSERT_NOT_NULL(s);
+
+    s = twom_strerror(TWOM_EXISTS);
+    ASSERT_NOT_NULL(s);
+
+    s = twom_strerror(TWOM_INTERNAL);
+    ASSERT_NOT_NULL(s);
+
+    s = twom_strerror(TWOM_NOTFOUND);
+    ASSERT_NOT_NULL(s);
+
+    s = twom_strerror(TWOM_LOCKED);
+    ASSERT_NOT_NULL(s);
+
+    s = twom_strerror(TWOM_READONLY);
+    ASSERT_NOT_NULL(s);
+
+    /* unknown code should still return something */
+    s = twom_strerror(-999);
+    ASSERT_NOT_NULL(s);
+}
+
+/*
+ * ============================================================
  * Test runner
  * ============================================================
  */
@@ -2775,6 +3214,16 @@ static struct test_entry tests[] = {
     { "test_mvcc_write_while_reading",      test_mvcc_write_while_reading },
     { "test_mvcc_delete_while_reading",     test_mvcc_delete_while_reading },
     { "test_mvcc_create_delete_invisible",  test_mvcc_create_delete_invisible },
+    { "test_repack",             test_repack },
+    { "test_metadata",           test_metadata },
+    { "test_readonly",           test_readonly },
+    { "test_conditional_store",  test_conditional_store },
+    { "test_nosync",             test_nosync },
+    { "test_nocheck",            test_nocheck },
+    { "test_sync",               test_sync },
+    { "test_dump",               test_dump },
+    { "test_txn_yield",          test_txn_yield },
+    { "test_strerror",           test_strerror },
     { NULL, NULL }
 };
 
