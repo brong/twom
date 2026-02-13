@@ -1,6 +1,7 @@
 /* twomtool.c -- standalone CLI tool for twom databases
  *
- * https://creativecommons.org/publicdomain/zero/1.0/
+ * Available under any of: CC0-1.0, 0BSD, or MIT-0
+ * See LICENSE-CC0, LICENSE-0BSD, or LICENSE-MIT-0 for details.
  */
 
 #include <errno.h>
