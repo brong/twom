@@ -15,7 +15,11 @@ twom provides a file-backed ordered key-value database with:
 
 ## License
 
-CC0 1.0 Universal — public domain. See [LICENSE](LICENSE).
+This software is available under any of the following licenses, at your choice:
+
+- [CC0 1.0 Universal](LICENSE-CC0) — public domain dedication
+- [Zero-Clause BSD (0BSD)](LICENSE-0BSD)
+- [MIT No Attribution (MIT-0)](LICENSE-MIT-0)
 
 ## Dependencies
 
