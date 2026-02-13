@@ -5,3 +5,13 @@
 twomtool
 twomtest
 twom.pc
+
+# Debian build artifacts
+debian/.debhelper/
+debian/debhelper-build-stamp
+debian/files
+debian/*.substvars
+debian/tmp/
+debian/libtwom-dev/
+debian/libtwom0/
+debian/twom-tools/
