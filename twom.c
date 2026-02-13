@@ -521,13 +521,14 @@ static inline int tm_ensure(struct twom_db *db, size_t offset)
 
     // map the larger file into new memory
     file->size = newoffset;
-    file->base = (char *)mmap((caddr_t)0, file->size, PROT_READ|PROT_WRITE, MAP_SHARED, db->openfile->fd, 0L);
-    if (!file->base) {
+    void *map = mmap((caddr_t)0, file->size, PROT_READ|PROT_WRITE, MAP_SHARED, db->openfile->fd, 0L);
+    if (map == MAP_FAILED) {
         db->error("twom failed to mmap during tm_ensure",
                    "filename=<%s> newsize=<%08llX>",
                    db->fname, (LLU)file->size);
         return TWOM_IOERROR;
     }
+    file->base = map;
 
     return 0;
 }
@@ -1659,13 +1660,14 @@ static int write_lock(struct twom_db *db, struct twom_txn **txnp,
     if (file->size < (size_t)sbuf.st_size) {
         if (file->size) munmap(file->base, file->size);
         file->size = sbuf.st_size;
-        file->base = (char *)mmap((caddr_t)0, file->size, PROT_READ|PROT_WRITE, MAP_SHARED, file->fd, 0L);
-        if (!file->base) {
+        void *map = mmap((caddr_t)0, file->size, PROT_READ|PROT_WRITE, MAP_SHARED, file->fd, 0L);
+        if (map == MAP_FAILED) {
             db->error("write_lock mmap failed",
                       "filename=<%s> size=<%08llX>", db->fname, (LLU)file->size);
             r = TWOM_IOERROR;
             goto done;
         }
+        file->base = map;
     }
 
     /* reread header */
@@ -1812,13 +1814,14 @@ static int read_lock(struct twom_db *db, struct twom_txn **txnp,
         if (file->size) munmap(file->base, file->size);
         int flags = db->readonly ? PROT_READ : PROT_READ|PROT_WRITE;
         file->size = sbuf.st_size;
-        file->base = (char *)mmap((caddr_t)0, file->size, flags, MAP_SHARED, file->fd, 0L);
-        if (!file->base) {
+        void *map = mmap((caddr_t)0, file->size, flags, MAP_SHARED, file->fd, 0L);
+        if (map == MAP_FAILED) {
             db->error("read_lock mmap failed",
                       "filename=<%s> size=<%08llX>", db->fname, (LLU)file->size);
             r = TWOM_IOERROR;
             goto done;
         }
+        file->base = map;
     }
 
     // reread header
