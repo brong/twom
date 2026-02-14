@@ -3627,6 +3627,118 @@ static void test_delete_nonexistent(void)
 
 /*
  * ============================================================
+ * test_csum_null
+ *
+ * Open a database with the null checksum engine (always returns 0).
+ * ============================================================
+ */
+static void test_csum_null(void)
+{
+    struct twom_db *db = NULL;
+    struct twom_txn *txn = NULL;
+    int r;
+
+    struct twom_open_data init = TWOM_OPEN_DATA_INITIALIZER;
+    init.flags = TWOM_CREATE | TWOM_CSUM_NULL;
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    CANSTORE("key1", 4, "val1", 4);
+    CANSTORE("key2", 4, "val2", 4);
+    CANCOMMIT();
+
+    CANFETCH_NOTXN("key1", 4, "val1", 4);
+    CANFETCH_NOTXN("key2", 4, "val2", 4);
+    ASSERT_EQ(twom_db_num_records(db), 2);
+    ISCONSISTENT();
+
+    /* replace and delete */
+    CANSTORE("key1", 4, "new1", 4);
+    CANCOMMIT();
+    CANDELETE("key2", 4);
+    CANCOMMIT();
+    ASSERT_EQ(twom_db_num_records(db), 1);
+    CANFETCH_NOTXN("key1", 4, "new1", 4);
+
+    /* repack */
+    r = twom_db_repack(db);
+    ASSERT_OK(r);
+    CANFETCH_NOTXN("key1", 4, "new1", 4);
+    ISCONSISTENT();
+
+    /* close and reopen */
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+    init.flags = TWOM_CSUM_NULL;
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+    CANFETCH_NOTXN("key1", 4, "new1", 4);
+    ISCONSISTENT();
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+}
+
+/*
+ * ============================================================
+ * test_csum_external
+ *
+ * Open a database with a caller-provided checksum function.
+ * ============================================================
+ */
+static uint32_t my_csum(const char *base, size_t len)
+{
+    /* simple additive hash for testing */
+    uint32_t h = 0;
+    for (size_t i = 0; i < len; i++)
+        h = h * 31 + (unsigned char)base[i];
+    return h;
+}
+
+static void test_csum_external(void)
+{
+    struct twom_db *db = NULL;
+    struct twom_txn *txn = NULL;
+    int r;
+
+    struct twom_open_data init = TWOM_OPEN_DATA_INITIALIZER;
+    init.flags = TWOM_CREATE | TWOM_CSUM_EXTERNAL;
+    init.csum = my_csum;
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    CANSTORE("alpha", 5, "one", 3);
+    CANSTORE("beta", 4, "two", 3);
+    CANSTORE("gamma", 5, "three", 5);
+    CANCOMMIT();
+
+    CANFETCH_NOTXN("alpha", 5, "one", 3);
+    CANFETCH_NOTXN("beta", 4, "two", 3);
+    CANFETCH_NOTXN("gamma", 5, "three", 5);
+    ASSERT_EQ(twom_db_num_records(db), 3);
+    ISCONSISTENT();
+
+    /* repack with external checksum */
+    r = twom_db_repack(db);
+    ASSERT_OK(r);
+    CANFETCH_NOTXN("alpha", 5, "one", 3);
+    ISCONSISTENT();
+
+    /* close and reopen with the same csum function */
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+    init.flags = TWOM_CSUM_EXTERNAL;
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+    CANFETCH_NOTXN("beta", 4, "two", 3);
+    ISCONSISTENT();
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+}
+
+/*
+ * ============================================================
  * test_txn_nosync_noyield
  *
  * Test per-transaction NOSYNC and NOYIELD flags (as opposed to
@@ -4257,6 +4369,8 @@ static struct test_entry tests[] = {
     { "test_error_cases",        test_error_cases },
     { "test_store_identical",    test_store_identical },
     { "test_delete_nonexistent", test_delete_nonexistent },
+    { "test_csum_null",          test_csum_null },
+    { "test_csum_external",      test_csum_external },
     { "test_txn_nosync_noyield", test_txn_nosync_noyield },
     { "test_commit_readonly",    test_commit_readonly },
     { "test_compar_reverse",     test_compar_reverse },
