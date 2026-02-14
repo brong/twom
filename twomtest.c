@@ -3627,6 +3627,62 @@ static void test_delete_nonexistent(void)
 
 /*
  * ============================================================
+ * test_txn_nosync_noyield
+ *
+ * Test per-transaction NOSYNC and NOYIELD flags (as opposed to
+ * the database-level flags tested elsewhere).
+ * ============================================================
+ */
+static void test_txn_nosync_noyield(void)
+{
+    struct twom_db *db = NULL;
+    struct twom_txn *txn = NULL;
+    int r;
+
+    struct twom_open_data init = TWOM_OPEN_DATA_INITIALIZER;
+    init.flags = TWOM_CREATE;
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    /* write transaction with NOSYNC */
+    r = twom_db_begin_txn(db, TWOM_NOSYNC, &txn);
+    ASSERT_OK(r);
+    r = twom_txn_store(txn, "key1", 4, "val1", 4, 0);
+    ASSERT_OK(r);
+    r = twom_txn_store(txn, "key2", 4, "val2", 4, 0);
+    ASSERT_OK(r);
+    r = twom_txn_commit(&txn);
+    ASSERT_OK(r);
+
+    CANFETCH_NOTXN("key1", 4, "val1", 4);
+    CANFETCH_NOTXN("key2", 4, "val2", 4);
+
+    /* read transaction with NOYIELD */
+    r = twom_db_begin_txn(db, TWOM_SHARED | TWOM_NOYIELD, &txn);
+    ASSERT_OK(r);
+    CANFETCH("key1", 4, "val1", 4);
+    CANFETCH("key2", 4, "val2", 4);
+    r = twom_txn_commit(&txn);
+    ASSERT_OK(r);
+
+    /* write transaction with both NOSYNC and NOYIELD */
+    r = twom_db_begin_txn(db, TWOM_NOSYNC | TWOM_NOYIELD, &txn);
+    ASSERT_OK(r);
+    r = twom_txn_store(txn, "key3", 4, "val3", 4, 0);
+    ASSERT_OK(r);
+    r = twom_txn_commit(&txn);
+    ASSERT_OK(r);
+
+    ASSERT_EQ(twom_db_num_records(db), 3);
+    CANFETCH_NOTXN("key3", 4, "val3", 4);
+    ISCONSISTENT();
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+}
+
+/*
+ * ============================================================
  * test_commit_readonly
  *
  * Commit (rather than abort) a read-only transaction.
@@ -4201,6 +4257,7 @@ static struct test_entry tests[] = {
     { "test_error_cases",        test_error_cases },
     { "test_store_identical",    test_store_identical },
     { "test_delete_nonexistent", test_delete_nonexistent },
+    { "test_txn_nosync_noyield", test_txn_nosync_noyield },
     { "test_commit_readonly",    test_commit_readonly },
     { "test_compar_reverse",     test_compar_reverse },
     { "test_compar_caseless",    test_compar_caseless },
