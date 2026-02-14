@@ -3709,6 +3709,70 @@ static void test_delete_readd(void)
 
 /*
  * ============================================================
+ * test_mmap_val_reuse
+ *
+ * Fetch a value (which returns a pointer into the mmap), then
+ * pass that pointer directly to a store call for a different key.
+ * Exercises the valoffset path in store_here that handles value
+ * pointers inside the mmap surviving a potential remap.
+ * ============================================================
+ */
+static void test_mmap_val_reuse(void)
+{
+    struct twom_db *db = NULL;
+    struct twom_txn *txn = NULL;
+    int r;
+
+    struct twom_open_data init = TWOM_OPEN_DATA_INITIALIZER;
+    init.flags = TWOM_CREATE;
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    CANSTORE("src", 3, "shared_value", 12);
+    CANCOMMIT();
+
+    /* fetch the value - returns a pointer into the mmap */
+    r = twom_db_begin_txn(db, 0, &txn);
+    ASSERT_OK(r);
+
+    const char *val;
+    size_t vallen;
+    r = twom_txn_fetch(txn, "src", 3, NULL, NULL, &val, &vallen, 0);
+    ASSERT_OK(r);
+    ASSERT_EQ(vallen, 12);
+
+    /* store a new key using the mmap'd value pointer directly */
+    r = twom_txn_store(txn, "dst", 3, val, vallen, 0);
+    ASSERT_OK(r);
+
+    r = twom_txn_commit(&txn);
+    ASSERT_OK(r);
+
+    /* both keys should have the same value */
+    CANFETCH_NOTXN("src", 3, "shared_value", 12);
+    CANFETCH_NOTXN("dst", 3, "shared_value", 12);
+    ISCONSISTENT();
+
+    /* also test: fetch a value and use it to replace a different key's value */
+    r = twom_db_begin_txn(db, 0, &txn);
+    ASSERT_OK(r);
+    r = twom_txn_fetch(txn, "src", 3, NULL, NULL, &val, &vallen, 0);
+    ASSERT_OK(r);
+    /* use it to replace dst's value (which is the same, so use src's for a third key) */
+    r = twom_txn_store(txn, "third", 5, val, vallen, 0);
+    ASSERT_OK(r);
+    r = twom_txn_commit(&txn);
+    ASSERT_OK(r);
+
+    CANFETCH_NOTXN("third", 5, "shared_value", 12);
+    ISCONSISTENT();
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+}
+
+/*
+ * ============================================================
  * test_csum_null
  *
  * Open a database with the null checksum engine (always returns 0).
@@ -4452,6 +4516,7 @@ static struct test_entry tests[] = {
     { "test_store_identical",    test_store_identical },
     { "test_delete_nonexistent", test_delete_nonexistent },
     { "test_delete_readd",       test_delete_readd },
+    { "test_mmap_val_reuse",     test_mmap_val_reuse },
     { "test_csum_null",          test_csum_null },
     { "test_csum_external",      test_csum_external },
     { "test_txn_nosync_noyield", test_txn_nosync_noyield },
