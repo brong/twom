@@ -3627,6 +3627,88 @@ static void test_delete_nonexistent(void)
 
 /*
  * ============================================================
+ * test_delete_readd
+ *
+ * Within a single write transaction: add a key, delete it, then
+ * re-add it with a new value.  Exercises the deleted_offset
+ * ancestor chaining path in store_here.
+ * ============================================================
+ */
+static void test_delete_readd(void)
+{
+    struct twom_db *db = NULL;
+    struct twom_txn *txn = NULL;
+    int r;
+
+    struct twom_open_data init = TWOM_OPEN_DATA_INITIALIZER;
+    init.flags = TWOM_CREATE;
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    /* add, delete, re-add within a single transaction */
+    r = twom_db_begin_txn(db, 0, &txn);
+    ASSERT_OK(r);
+
+    r = twom_txn_store(txn, "key1", 4, "first", 5, 0);
+    ASSERT_OK(r);
+
+    /* in-transaction fetch sees the value */
+    CANFETCH("key1", 4, "first", 5);
+
+    /* delete within the same transaction */
+    r = twom_txn_store(txn, "key1", 4, NULL, 0, 0);
+    ASSERT_OK(r);
+
+    /* in-transaction fetch: should be gone */
+    {
+        const char *val;
+        size_t vallen;
+        r = twom_txn_fetch(txn, "key1", 4, NULL, NULL, &val, &vallen, 0);
+        ASSERT_EQ(r, TWOM_NOTFOUND);
+    }
+
+    /* re-add with a new value (exercises deleted_offset path) */
+    r = twom_txn_store(txn, "key1", 4, "second", 6, 0);
+    ASSERT_OK(r);
+
+    /* in-transaction fetch sees the new value */
+    CANFETCH("key1", 4, "second", 6);
+
+    r = twom_txn_commit(&txn);
+    ASSERT_OK(r);
+
+    /* post-commit: the new value is visible */
+    CANFETCH_NOTXN("key1", 4, "second", 6);
+    ASSERT_EQ(twom_db_num_records(db), 1);
+    ISCONSISTENT();
+
+    /* also test: add two keys, delete first, re-add first, all in one txn */
+    r = twom_db_begin_txn(db, 0, &txn);
+    ASSERT_OK(r);
+    r = twom_txn_store(txn, "aaa", 3, "val_a", 5, 0);
+    ASSERT_OK(r);
+    r = twom_txn_store(txn, "zzz", 3, "val_z", 5, 0);
+    ASSERT_OK(r);
+    /* delete "aaa" */
+    r = twom_txn_store(txn, "aaa", 3, NULL, 0, 0);
+    ASSERT_OK(r);
+    /* re-add "aaa" with new value */
+    r = twom_txn_store(txn, "aaa", 3, "new_a", 5, 0);
+    ASSERT_OK(r);
+    r = twom_txn_commit(&txn);
+    ASSERT_OK(r);
+
+    CANFETCH_NOTXN("aaa", 3, "new_a", 5);
+    CANFETCH_NOTXN("zzz", 3, "val_z", 5);
+    ASSERT_EQ(twom_db_num_records(db), 3);
+    ISCONSISTENT();
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+}
+
+/*
+ * ============================================================
  * test_csum_null
  *
  * Open a database with the null checksum engine (always returns 0).
@@ -4369,6 +4451,7 @@ static struct test_entry tests[] = {
     { "test_error_cases",        test_error_cases },
     { "test_store_identical",    test_store_identical },
     { "test_delete_nonexistent", test_delete_nonexistent },
+    { "test_delete_readd",       test_delete_readd },
     { "test_csum_null",          test_csum_null },
     { "test_csum_external",      test_csum_external },
     { "test_txn_nosync_noyield", test_txn_nosync_noyield },
