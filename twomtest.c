@@ -3832,6 +3832,80 @@ static void test_dump_detail(void)
 
 /*
  * ============================================================
+ * test_recovery_with_records
+ *
+ * Simulate a crash by setting the DIRTY flag in the header after
+ * normal writes.  On reopen, recovery walks all data records,
+ * re-stitching skip pointers.
+ * ============================================================
+ */
+static void test_recovery_with_records(void)
+{
+    struct twom_db *db = NULL;
+    struct twom_txn *txn = NULL;
+    int r;
+
+    struct twom_open_data init = TWOM_OPEN_DATA_INITIALIZER;
+    init.flags = TWOM_CREATE;
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    /* store several records with replaces to create ancestor chains */
+    CANSTORE("apple", 5, "a1", 2);
+    CANSTORE("banana", 6, "b1", 2);
+    CANSTORE("cherry", 6, "c1", 2);
+    CANSTORE("date", 4, "d1", 2);
+    CANCOMMIT();
+
+    /* replace some values to create REPLACE records */
+    CANSTORE("banana", 6, "b2", 2);
+    CANCOMMIT();
+    CANSTORE("date", 4, "d2", 2);
+    CANCOMMIT();
+
+    /* delete one to get a DELETE record */
+    CANDELETE("cherry", 6);
+    CANCOMMIT();
+
+    ASSERT_EQ(twom_db_num_records(db), 3);
+    ISCONSISTENT();
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+
+    /* now simulate a crash: set the DIRTY flag in the raw file header */
+    {
+        int fd = open(filename, O_RDWR);
+        ASSERT(fd >= 0);
+        uint32_t flags;
+        pread(fd, &flags, 4, 36); /* OFFSET_FLAGS = 36 */
+        flags = le32toh(flags);
+        flags |= 1; /* DIRTY = 1<<0 */
+        flags = htole32(flags);
+        pwrite(fd, &flags, 4, 36);
+        close(fd);
+    }
+
+    /* reopen with NOCSUM to skip header checksum validation
+     * (we modified flags without updating the header checksum) */
+    init.flags = TWOM_NOCSUM;
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    /* recovery should have run and all data should be intact */
+    CANFETCH_NOTXN("apple", 5, "a1", 2);
+    CANFETCH_NOTXN("banana", 6, "b2", 2);
+    CANFETCH_NOTXN("date", 4, "d2", 2);
+    CANNOTFETCH_NOTXN("cherry", 6, TWOM_NOTFOUND);
+    ASSERT_EQ(twom_db_num_records(db), 3);
+    ISCONSISTENT();
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+}
+
+/*
+ * ============================================================
  * test_csum_null
  *
  * Open a database with the null checksum engine (always returns 0).
@@ -4576,6 +4650,7 @@ static struct test_entry tests[] = {
     { "test_delete_nonexistent", test_delete_nonexistent },
     { "test_delete_readd",       test_delete_readd },
     { "test_dump_detail",        test_dump_detail },
+    { "test_recovery_with_records", test_recovery_with_records },
     { "test_mmap_val_reuse",     test_mmap_val_reuse },
     { "test_csum_null",          test_csum_null },
     { "test_csum_external",      test_csum_external },
