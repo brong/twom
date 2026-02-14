@@ -3773,6 +3773,65 @@ static void test_mmap_val_reuse(void)
 
 /*
  * ============================================================
+ * test_dump_detail
+ *
+ * Dump a database that contains DELETE records, and use detail
+ * level 3 (which prints values).  Covers the DELETE-record and
+ * high-detail branches in twom_txn_dump.
+ * ============================================================
+ */
+static void test_dump_detail(void)
+{
+    struct twom_db *db = NULL;
+    struct twom_txn *txn = NULL;
+    int r;
+
+    struct twom_open_data init = TWOM_OPEN_DATA_INITIALIZER;
+    init.flags = TWOM_CREATE;
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    CANSTORE("aaa", 3, "val_a", 5);
+    CANSTORE("bbb", 3, "val_b", 5);
+    CANSTORE("ccc", 3, "val_c", 5);
+    CANCOMMIT();
+
+    /* replace one key so we get a REPLACE record */
+    CANSTORE("bbb", 3, "val_B", 5);
+    CANCOMMIT();
+
+    /* delete one key so we get a DELETE record */
+    CANDELETE("ccc", 3);
+    CANCOMMIT();
+
+    /* redirect stdout to /dev/null */
+    fflush(stdout);
+    int saved_stdout = dup(STDOUT_FILENO);
+    int devnull = open("/dev/null", O_WRONLY);
+    dup2(devnull, STDOUT_FILENO);
+    close(devnull);
+
+    /* dump at detail level 3 (includes values and DELETE records) */
+    r = twom_db_dump(db, 3);
+    ASSERT_OK(r);
+
+    /* also dump at level 2 for good measure */
+    r = twom_db_dump(db, 2);
+    ASSERT_OK(r);
+
+    /* restore stdout */
+    fflush(stdout);
+    dup2(saved_stdout, STDOUT_FILENO);
+    close(saved_stdout);
+
+    ISCONSISTENT();
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+}
+
+/*
+ * ============================================================
  * test_csum_null
  *
  * Open a database with the null checksum engine (always returns 0).
@@ -4516,6 +4575,7 @@ static struct test_entry tests[] = {
     { "test_store_identical",    test_store_identical },
     { "test_delete_nonexistent", test_delete_nonexistent },
     { "test_delete_readd",       test_delete_readd },
+    { "test_dump_detail",        test_dump_detail },
     { "test_mmap_val_reuse",     test_mmap_val_reuse },
     { "test_csum_null",          test_csum_null },
     { "test_csum_external",      test_csum_external },
