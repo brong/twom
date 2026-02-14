@@ -3514,6 +3514,119 @@ static void test_error_cases(void)
 
 /*
  * ============================================================
+ * test_store_identical
+ *
+ * Storing a key with the same value should be a no-op (skipwrite
+ * optimization).  Verify the file size doesn't grow beyond a COMMIT.
+ * ============================================================
+ */
+static void test_store_identical(void)
+{
+    struct twom_db *db = NULL;
+    struct twom_txn *txn = NULL;
+    int r;
+
+    struct twom_open_data init = TWOM_OPEN_DATA_INITIALIZER;
+    init.flags = TWOM_CREATE;
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    CANSTORE("key1", 4, "val1", 4);
+    CANCOMMIT();
+
+    size_t size_before = twom_db_size(db);
+
+    /* store the exact same key and value */
+    CANSTORE("key1", 4, "val1", 4);
+    CANCOMMIT();
+
+    size_t size_after = twom_db_size(db);
+
+    /* file should not have grown at all - the store was a no-op so the
+     * DIRTY flag was never set and the commit wrote nothing either */
+    ASSERT_EQ(size_after, size_before);
+
+    /* still one record */
+    ASSERT_EQ(twom_db_num_records(db), 1);
+    CANFETCH_NOTXN("key1", 4, "val1", 4);
+    ISCONSISTENT();
+
+    /* also test via cursor_replace with identical value */
+    size_before = twom_db_size(db);
+    {
+        struct twom_cursor *cur = NULL;
+        const char *key, *val;
+        size_t keylen, vallen;
+        r = twom_db_begin_cursor(db, NULL, 0, &cur, 0);
+        ASSERT_OK(r);
+        r = twom_cursor_next(cur, &key, &keylen, &val, &vallen);
+        ASSERT_OK(r);
+        /* replace with the same value */
+        r = twom_cursor_replace(cur, "val1", 4, 0);
+        ASSERT_OK(r);
+        r = twom_cursor_commit(&cur);
+        ASSERT_OK(r);
+    }
+    size_after = twom_db_size(db);
+    ASSERT_EQ(size_after, size_before); /* complete no-op */
+    ISCONSISTENT();
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+}
+
+/*
+ * ============================================================
+ * test_delete_nonexistent
+ *
+ * Deleting a key that doesn't exist should be a silent no-op.
+ * ============================================================
+ */
+static void test_delete_nonexistent(void)
+{
+    struct twom_db *db = NULL;
+    struct twom_txn *txn = NULL;
+    int r;
+
+    struct twom_open_data init = TWOM_OPEN_DATA_INITIALIZER;
+    init.flags = TWOM_CREATE;
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    CANSTORE("key1", 4, "val1", 4);
+    CANCOMMIT();
+
+    size_t size_before = twom_db_size(db);
+
+    /* delete a key that doesn't exist */
+    r = twom_db_begin_txn(db, 0, &txn);
+    ASSERT_OK(r);
+    r = twom_txn_store(txn, "nokey", 5, NULL, 0, 0);
+    ASSERT_OK(r);
+    r = twom_txn_commit(&txn);
+    ASSERT_OK(r);
+
+    /* file should not have grown - delete of non-existent is a no-op */
+    ASSERT_EQ(twom_db_size(db), size_before);
+
+    /* original record still there */
+    ASSERT_EQ(twom_db_num_records(db), 1);
+    CANFETCH_NOTXN("key1", 4, "val1", 4);
+
+    /* also test via twom_db_store convenience */
+    size_before = twom_db_size(db);
+    r = twom_db_store(db, "nope", 4, NULL, 0, 0);
+    ASSERT_OK(r);
+    ASSERT_EQ(twom_db_size(db), size_before);
+
+    ISCONSISTENT();
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+}
+
+/*
+ * ============================================================
  * test_commit_readonly
  *
  * Commit (rather than abort) a read-only transaction.
@@ -4086,6 +4199,8 @@ static struct test_entry tests[] = {
     { "test_open_with_txn",      test_open_with_txn },
     { "test_foreach_goodp",      test_foreach_goodp },
     { "test_error_cases",        test_error_cases },
+    { "test_store_identical",    test_store_identical },
+    { "test_delete_nonexistent", test_delete_nonexistent },
     { "test_commit_readonly",    test_commit_readonly },
     { "test_compar_reverse",     test_compar_reverse },
     { "test_compar_caseless",    test_compar_caseless },
