@@ -3239,6 +3239,12 @@ int twom_db_repack(struct twom_db *db)
         break;
     }
 
+    // if the file is dirty (unclean shutdown), we can't safely repack.
+    // a read-only transaction won't run recovery, and the consistency
+    // check will fail on uncommitted records.  The next writer will
+    // run recovery, and then repack can succeed.
+    if (!db_is_clean(db, db->openfile)) return TWOM_LOCKED;
+
     int r = twom_db_begin_txn(db, TWOM_SHARED|TWOM_MVCC, &txn);
     if (r) return r;
 
