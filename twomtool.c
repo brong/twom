@@ -270,6 +270,7 @@ static void usage(const char *progname)
     fprintf(stderr, "  delete <key>      delete key\n");
     fprintf(stderr, "  dump [<level>]    internal format dump\n");
     fprintf(stderr, "  consistent        check database consistency\n");
+    fprintf(stderr, "  repair            repair records with truncated keylen/vallen\n");
     fprintf(stderr, "  repack            repack/compact the database\n");
     fprintf(stderr, "  damage            write then crash (recovery testing)\n");
     fprintf(stderr, "  batch             batch mode from stdin\n");
@@ -449,6 +450,11 @@ int main(int argc, char *argv[])
         } else {
             printf("Yes, consistent\n");
         }
+    } else if (!strcmp(action, "repair")) {
+        size_t nfixed = 0;
+        r = twom_db_repair(db, &nfixed);
+        if (!r)
+            printf("repair: %zu record(s) fixed\n", nfixed);
     } else if (!strcmp(action, "repack")) {
         r = twom_db_repack(db);
     } else if (!strcmp(action, "damage")) {

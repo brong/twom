@@ -94,6 +94,7 @@ int twom_db_store(struct twom_db *db,
 
 // utility
 int twom_db_dump(struct twom_db *, int detail);
+int twom_db_repair(struct twom_db *db, size_t *nfixedp);
 int twom_db_check_consistency(struct twom_db *db);
 int twom_db_repack(struct twom_db *db);
 bool twom_db_should_repack(struct twom_db *db); // returns 1 for true

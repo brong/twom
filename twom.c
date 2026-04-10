@@ -3223,6 +3223,226 @@ int twom_db_dump(struct twom_db *db, int detail)
     return r;
 }
 
+/* Repair records whose keylen or vallen was silently truncated due to the
+ * skinny-record uint16_t/uint32_t overflow bug.
+ *
+ * Detection: for a skinny ADD/REPLACE, the byte immediately after the stored
+ * key must be NUL (store_here always writes a NUL terminator there).  If it is
+ * not, the true keylen must be stored_keylen + N*65536 for some N≥1.  We scan
+ * forward in 65536-byte steps until we find the NUL, then verify by
+ * re-computing the tail checksum with the candidate lengths.
+ *
+ * Repair: position the location (via find_loc with the truncated key) so that
+ * store_here replaces the broken record in-place in the skiplist and creates a
+ * correct FATADD/FATREPLACE record with the right 64-bit lengths.
+ *
+ * Returns TWOM_OK on success.  *nfixedp (if non-NULL) receives the count of
+ * records repaired. */
+int twom_db_repair(struct twom_db *db, size_t *nfixedp)
+{
+    struct twom_txn *txn = NULL;
+    int r = twom_db_begin_txn(db, 0, &txn);
+    if (r) return r;
+
+    struct tm_file *file = txn->file;
+
+    /* ------------------------------------------------------------------ *
+     * Pass 1 — scan the live skiplist for broken records.
+     * We disable checksum verification so advance_loc doesn't abort when
+     * it encounters a record whose tail checksum covers the full (real)
+     * key but the stored keylen is only 16 bits wide.
+     * ------------------------------------------------------------------ */
+    int saved_nocsum = db->nocsum;
+    db->nocsum = 1;
+
+    struct repair_item {
+        size_t offset;           /* byte offset of the broken record   */
+        size_t stored_keylen;    /* uint16_t value written on disk     */
+        size_t real_keylen;      /* true keylen found via NUL scan     */
+        size_t real_vallen;      /* vallen (stored uint32_t, unchanged)*/
+        char  *key;              /* malloc'd copy of the full key      */
+        char  *val;              /* malloc'd copy of the value         */
+    };
+
+    size_t capacity = 16, nbroken = 0;
+    struct repair_item *broken = malloc(capacity * sizeof(*broken));
+    if (!broken) {
+        db->nocsum = saved_nocsum;
+        twom_txn_abort(&txn);
+        return TWOM_IOERROR;
+    }
+
+    /* initialise loc so advance_loc starts from the very first record */
+    struct tm_loc *loc = &db->loc;
+    r = find_loc(txn, loc, NULL, 0);
+    if (r) goto fail;
+
+    for (;;) {
+        r = advance_loc(txn, loc);
+        if (r == TWOM_DONE) { r = 0; break; }
+        if (r) goto fail;
+
+        /* deleted records don't need repair (no live tail) */
+        if (loc->deleted_offset) continue;
+
+        const char *ptr = LOCPTR(loc);
+        size_t cur_offset = loc->offset;
+        uint8_t type = TYPE(ptr);
+
+        /* only skinny records can overflow — fat records already have
+         * 64-bit lengths and are correct by construction */
+        if (fatrecord[type]) continue;
+
+        size_t stored_keylen = KLSKINNY(ptr);
+        size_t stored_vallen = VLSKINNY(ptr);
+        size_t headlen = HEADLEN(ptr);
+        const char *keyptr = ptr + headlen + 8;   /* == KEYPTR(ptr) */
+
+        /* the NUL terminator after the key must be within the file */
+        if (cur_offset + headlen + 8 + stored_keylen >= file->size) continue;
+
+        if (keyptr[stored_keylen] == '\0') continue;  /* looks fine */
+
+        /* scan forward in 65536-byte increments for the true NUL */
+        size_t real_keylen = stored_keylen + 65536;
+        size_t max_off = file->size - (cur_offset + headlen + 8 + 1);
+        while (real_keylen < max_off && keyptr[real_keylen] != '\0')
+            real_keylen += 65536;
+
+        if (real_keylen >= max_off) {
+            db->error("repair: cannot find key terminator",
+                      "filename=<%s> offset=<%08llX> stored_keylen=<%zu>",
+                      db->fname, (LLU)cur_offset, stored_keylen);
+            continue;
+        }
+
+        /* verify by re-computing the tail checksum with the real lengths */
+        size_t real_vallen = stored_vallen;
+        size_t real_taillen = PAD8(real_keylen + real_vallen + 2);
+        if (cur_offset + headlen + 8 + real_taillen > file->size) {
+            db->error("repair: real record exceeds file size",
+                      "filename=<%s> offset=<%08llX>",
+                      db->fname, (LLU)cur_offset);
+            continue;
+        }
+        uint32_t csum = file->csum(keyptr, real_taillen);
+        if (csum != TAILCSUM(ptr)) {
+            db->error("repair: NUL found but tailcsum mismatch",
+                      "filename=<%s> offset=<%08llX> real_keylen=<%zu>",
+                      db->fname, (LLU)cur_offset, real_keylen);
+            continue;
+        }
+
+        /* save copies — the mmap may move when store_here calls tm_ensure */
+        char *keycopy = malloc(real_keylen);
+        char *valcopy = malloc(real_vallen ? real_vallen : 1);
+        if (!keycopy || !valcopy) {
+            free(keycopy); free(valcopy);
+            r = TWOM_IOERROR;
+            goto fail;
+        }
+        memcpy(keycopy, keyptr, real_keylen);
+        memcpy(valcopy, keyptr + real_keylen + 1, real_vallen);
+
+        if (nbroken >= capacity) {
+            capacity *= 2;
+            struct repair_item *tmp = realloc(broken, capacity * sizeof(*broken));
+            if (!tmp) { free(keycopy); free(valcopy); r = TWOM_IOERROR; goto fail; }
+            broken = tmp;
+        }
+        broken[nbroken++] = (struct repair_item){
+            cur_offset, stored_keylen, real_keylen, real_vallen, keycopy, valcopy
+        };
+    }
+
+    db->nocsum = saved_nocsum;
+
+    /* ------------------------------------------------------------------ *
+     * Pass 2 — fix each broken record.
+     * Use find_loc with the TRUNCATED key to position exactly at the
+     * broken record, then store_here with the full key/value.  The
+     * store_here REPLACE path wires the new FAT record into the skiplist.
+     * Afterward we zero the new record's ancestor pointer so consistent1
+     * does not traverse back to the broken record (which has a truncated
+     * keylen that wouldn't match).
+     * ------------------------------------------------------------------ */
+    size_t nfixed = 0;
+    for (size_t i = 0; i < nbroken; i++) {
+        struct repair_item *item = &broken[i];
+
+        r = find_loc(txn, loc, item->key, item->stored_keylen);
+        if (r) {
+            db->error("repair: find_loc failed for broken record",
+                      "filename=<%s> offset=<%08llX>",
+                      db->fname, (LLU)item->offset);
+            r = 0;
+            continue;
+        }
+
+        /* paranoia: make sure we landed on the expected record */
+        if (loc->offset != item->offset || loc->deleted_offset) {
+            db->error("repair: broken record no longer at expected offset",
+                      "filename=<%s> offset=<%08llX>",
+                      db->fname, (LLU)item->offset);
+            continue;
+        }
+
+        /* store_here will REPLACE (type++ → FATREPLACE) the broken
+         * record, updating all skiplist backpointers automatically.
+         * Save the truncated RECLEN before store_here may remap. */
+        size_t old_dirty = RECLEN(LOCPTR(loc));
+
+        r = store_here(txn, item->key, item->real_keylen,
+                       item->val, item->real_vallen);
+        if (r) goto fail2;
+
+        /* store_here set ancestor = broken_ADD_offset.  consistent1
+         * would then compare the FATREPLACE key (real_keylen bytes)
+         * against the ancestor's stored keylen (truncated), and report
+         * "mismatched ancestor".  Fix this by zeroing the ancestor
+         * field and recomputing the headcsum.  Also undo the
+         * dirty_size increment that store_here added using the
+         * truncated RECLEN; the broken record is now unreachable dead
+         * space that consistent1 won't encounter while walking the
+         * skiplist. */
+        {
+            char *new_ptr = file->base + loc->offset;
+            uint8_t aoff = ancestoroffset[(uint8_t)TYPE(new_ptr)];
+            if (aoff) {
+                file->header.dirty_size -= old_dirty;
+                *((uint64_t *)(new_ptr + aoff)) = 0;
+                _recsum(file, new_ptr);
+            }
+        }
+        nfixed++;
+    }
+
+    for (size_t i = 0; i < nbroken; i++) {
+        free(broken[i].key);
+        free(broken[i].val);
+    }
+    free(broken);
+
+    if (nfixedp) *nfixedp = nfixed;
+
+    if (nfixed == 0) {
+        twom_txn_abort(&txn);
+        return TWOM_OK;
+    }
+    return twom_txn_commit(&txn);
+
+fail:
+    db->nocsum = saved_nocsum;
+fail2:
+    for (size_t i = 0; i < nbroken; i++) {
+        free(broken[i].key);
+        free(broken[i].val);
+    }
+    free(broken);
+    twom_txn_abort(&txn);
+    return r;
+}
+
 int twom_db_check_consistency(struct twom_db *db)
 {
     struct twom_txn *txn = NULL;

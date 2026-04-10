@@ -27,6 +27,14 @@
 
 #include "twom.h"
 
+/* Needed to craft binary twom files for repair testing */
+#define XXH_INLINE_ALL
+#include "xxhash.h"
+static uint32_t test_xxcsum(const char *data, size_t len) {
+    if (!len) return 0;
+    return (uint32_t)XXH3_64bits(data, len);
+}
+
 /*
  * ============================================================
  * Test framework
@@ -4841,6 +4849,202 @@ static void test_huge_key(void)
 
 /*
  * ============================================================
+ * Helpers for crafting broken twom databases directly on disk.
+ *
+ * File layout reproduced from twom.c constants:
+ *   HEADER (96 bytes) | DUMMY (272 bytes) | records ... | COMMIT (24 bytes)
+ *
+ * The broken ADD record has stored keylen = real_keylen & 0xFFFF but
+ * the full real_keylen bytes of key data on disk, so the tail checksum
+ * covers the full key while the stored uint16_t says only part of it.
+ * ============================================================
+ */
+
+/* 96-byte header field offsets (from twom.c OFFSET_* enum) */
+#define TH_HEADER_SIZE   96
+#define TH_DUMMY_OFFSET  96
+#define TH_DUMMY_SIZE    272   /* 24 + 8*31 */
+#define TH_MAGIC         "\241\002\213\015twomfile\0\0\0\0"
+#define TH_OFF_VERSION   32
+#define TH_OFF_FLAGS     36
+#define TH_OFF_GENERATION 40
+#define TH_OFF_NUMREC    48
+#define TH_OFF_NUMCOMMIT 56
+#define TH_OFF_DIRTYSIZE 64
+#define TH_OFF_REPACKSZ  72
+#define TH_OFF_CURRSZ    80
+#define TH_OFF_MAXLEVEL  88
+#define TH_OFF_CSUM      92
+
+static void th_write32le(char *p, uint32_t v)
+{
+    p[0]=(char)(v);p[1]=(char)(v>>8);p[2]=(char)(v>>16);p[3]=(char)(v>>24);
+}
+static void th_write64le(char *p, uint64_t v)
+{
+    th_write32le(p, (uint32_t)v);
+    th_write32le(p+4, (uint32_t)(v>>32));
+}
+static void th_write16le(char *p, uint16_t v)
+{
+    p[0]=(char)(v); p[1]=(char)(v>>8);
+}
+
+/* Create a minimal twom file at `path` that contains exactly one broken
+ * skinny ADD record: stored keylen = real_keylen & 0xFFFF, but all
+ * real_keylen bytes of the key are physically present and the tail
+ * checksum is correct for the full key length.
+ * Returns 0 on success, -1 on error. */
+static int make_broken_db(const char *path,
+                          size_t real_keylen, char keyfill,
+                          const char *val, size_t vallen)
+{
+    size_t stored_keylen = real_keylen & 0xFFFF;
+    /* real tail: key (real_keylen) + NUL + val (vallen) + NUL, padded to 8 */
+    size_t real_taillen = ((real_keylen + vallen + 2) + 7) & ~7;
+    /* ADD level=1: headlen=24, +8 csum bytes, then tail */
+    size_t add_off    = TH_DUMMY_OFFSET + TH_DUMMY_SIZE;  /* = 368 */
+    size_t add_reclen = 32 + real_taillen;
+    size_t commit_off = add_off + add_reclen;
+    size_t file_size  = commit_off + 24;
+
+    char *buf = calloc(file_size, 1);
+    if (!buf) return -1;
+
+    /* --- HEADER (96 bytes) --- */
+    memcpy(buf, TH_MAGIC, 16);
+    buf[TH_OFF_VERSION] = 1;
+    th_write32le(buf + TH_OFF_FLAGS,      1 << 28); /* TWOM_CSUM_XXH64 */
+    th_write64le(buf + TH_OFF_GENERATION, 1);
+    th_write64le(buf + TH_OFF_NUMREC,     1);
+    th_write64le(buf + TH_OFF_NUMCOMMIT,  1);
+    th_write64le(buf + TH_OFF_DIRTYSIZE,  0);
+    th_write64le(buf + TH_OFF_REPACKSZ,   file_size);
+    th_write64le(buf + TH_OFF_CURRSZ,     file_size);
+    buf[TH_OFF_MAXLEVEL] = 1;
+    th_write32le(buf + TH_OFF_CSUM, test_xxcsum(buf, TH_OFF_CSUM));
+
+    /* --- DUMMY (272 bytes at offset 96) --- */
+    /* type=1, level=31 */
+    char *d = buf + TH_DUMMY_OFFSET;
+    d[0] = 1; d[1] = 31;
+    /* next[0][primary] at d+8 → add_off (first user record) */
+    th_write64le(d + 8, add_off);
+    /* next[0][alt] at d+16 = 0 (MVCC alt slot) */
+    /* NEXTN(1..30) all zero — ADD participates only in level 0 (level=1) */
+    /* headcsum: DUMMY headlen = ptroffset[1]=8 + 8*(1+31) = 264 */
+    th_write32le(d + 264, test_xxcsum(d, 264));
+    /* tailcsum = 0 (DUMMY has no tail) */
+
+    /* --- broken ADD (level=1) at add_off --- */
+    char *a = buf + add_off;
+    a[0] = 2; a[1] = 1;  /* type=ADD, level=1 */
+    th_write16le(a + 2, (uint16_t)stored_keylen);
+    th_write32le(a + 4, (uint32_t)vallen);
+    /* next[0][primary]=0, next[0][alt]=0 — already zeroed */
+    /* headlen = ptroffset[ADD=2]=8 + 8*(1+1) = 24 */
+    th_write32le(a + 24, test_xxcsum(a, 24));
+    /* key data at a+32: real_keylen bytes of keyfill + NUL + val + NUL */
+    memset(a + 32, keyfill, real_keylen);
+    a[32 + real_keylen] = '\0';
+    memcpy(a + 32 + real_keylen + 1, val, vallen);
+    a[32 + real_keylen + 1 + vallen] = '\0';
+    /* tailcsum at a+28: covers the real full tail */
+    th_write32le(a + 28, test_xxcsum(a + 32, real_taillen));
+
+    /* --- COMMIT (24 bytes at commit_off) --- */
+    char *c = buf + commit_off;
+    c[0] = 7;  /* type=COMMIT */
+    /* c+8: current_size before this commit = add_off (before the ADD was stored) */
+    th_write64le(c + 8, add_off);
+    /* headcsum: COMMIT headlen = ptroffset[COMMIT=7]=8 + 8*(1+0) = 16 */
+    th_write32le(c + 16, test_xxcsum(c, 16));
+
+    /* Write to file */
+    FILE *f = fopen(path, "wb");
+    if (!f) { free(buf); return -1; }
+    size_t written = fwrite(buf, 1, file_size, f);
+    fclose(f);
+    free(buf);
+    return (written == file_size) ? 0 : -1;
+}
+
+/*
+ * ============================================================
+ * test_repair
+ *
+ * Creates a twom file with a hand-crafted broken ADD record
+ * (stored keylen = real_keylen & 0xFFFF, full key on disk),
+ * calls twom_db_repair(), and verifies that the record is
+ * accessible with its full key after repair.
+ * ============================================================
+ */
+static void test_repair(void)
+{
+    struct twom_db *db = NULL;
+    int r;
+
+    /* 65538 & 0xFFFF = 2: byte at KEYPTR+2 is 'K' (not NUL), so the
+     * repair scanner trips immediately and finds real_keylen after one
+     * 65536-byte step.  Key is all 'K' bytes, val is "world". */
+    const size_t real_keylen = 65538;
+    const char  *val         = "world";
+    const size_t vallen      = 5;
+
+    r = make_broken_db(filename, real_keylen, 'K', val, vallen);
+    ASSERT_EQ(r, 0);
+
+    struct twom_open_data init = TWOM_OPEN_DATA_INITIALIZER;
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    /* verify the record is indeed broken before repair */
+    {
+        char *k = malloc(real_keylen);
+        ASSERT_NOT_NULL(k);
+        memset(k, 'K', real_keylen);
+        const char *found_data = NULL;
+        size_t found_datalen = 0;
+        r = twom_db_fetch(db, k, real_keylen, NULL, NULL,
+                          &found_data, &found_datalen, 0);
+        /* expect BADCHECKSUM or NOTFOUND because the stored keylen is wrong */
+        ASSERT(r != TWOM_OK);
+        free(k);
+    }
+
+    /* repair: should fix exactly 1 record */
+    size_t nfixed = 0;
+    r = twom_db_repair(db, &nfixed);
+    ASSERT_OK(r);
+    ASSERT_EQ(nfixed, (size_t)1);
+
+    /* fetch should now succeed with the full key */
+    {
+        char *k = malloc(real_keylen);
+        ASSERT_NOT_NULL(k);
+        memset(k, 'K', real_keylen);
+        const char *found_data = NULL;
+        size_t found_datalen = 0;
+        const char *found_key = NULL;
+        size_t found_keylen = 0;
+        r = twom_db_fetch(db, k, real_keylen, &found_key, &found_keylen,
+                          &found_data, &found_datalen, 0);
+        ASSERT_OK(r);
+        ASSERT_EQ(found_keylen, real_keylen);
+        ASSERT_EQ(found_datalen, vallen);
+        ASSERT(memcmp(found_key, k, real_keylen) == 0);
+        ASSERT(memcmp(found_data, val, vallen) == 0);
+        free(k);
+    }
+
+    ISCONSISTENT();
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+}
+
+/*
+ * ============================================================
  * test_dump_corrupt
  *
  * Corrupt a record on disk and verify that twom_db_dump does
@@ -4991,6 +5195,7 @@ static struct test_entry tests[] = {
     { "test_compar_caseless",    test_compar_caseless },
     { "test_large_key",          test_large_key },
     { "test_huge_key",           test_huge_key },
+    { "test_repair",             test_repair },
     { "test_dump_corrupt",       test_dump_corrupt },
     { NULL, NULL }
 };
