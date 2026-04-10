@@ -12,7 +12,12 @@ VERSION = $(VERSION_MAJOR).$(VERSION_MINOR).$(VERSION_PATCH)
 CC ?= cc
 AR ?= ar
 CFLAGS ?= -Wall -Wextra -g
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+LDLIBS =
+else
 LDLIBS = -luuid
+endif
 
 PREFIX ?= /usr/local
 LIBDIR ?= $(PREFIX)/lib
