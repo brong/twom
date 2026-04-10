@@ -4723,6 +4723,209 @@ static void test_large_key(void)
 
 /*
  * ============================================================
+ * test_huge_key
+ *
+ * Test keys with length > 65535 (where they no longer fit in
+ * the skinny uint16_t keylen field and must be promoted to
+ * FATADD/FATREPLACE). Without the promotion, keylen would be
+ * silently truncated to 16 bits causing tail checksum failures
+ * and skiplist corruption (as seen in production Cyrus
+ * duplicate.db and conversations.db).
+ * ============================================================
+ */
+static void test_huge_key(void)
+{
+    struct twom_db *db = NULL;
+    struct twom_txn *txn = NULL;
+    int r;
+
+    /* pick a key size that would be truncated to a small value
+     * by a bad uint16_t cast (100035 & 0xFFFF == 34499), matching
+     * the real-world corruption pattern */
+    size_t keylen = 100035;
+    size_t vallen = 29;
+    char *key = malloc(keylen);
+    char *val = malloc(vallen);
+    ASSERT_NOT_NULL(key);
+    ASSERT_NOT_NULL(val);
+    /* fill with a non-constant pattern so truncation is detectable */
+    for (size_t i = 0; i < keylen; i++) key[i] = (char)(i & 0xFF);
+    memset(val, 'V', vallen);
+
+    struct twom_open_data init = TWOM_OPEN_DATA_INITIALIZER;
+    init.flags = TWOM_CREATE;
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    CANSTORE(key, keylen, val, vallen);
+    CANCOMMIT();
+
+    /* fetch all records - triggers tail checksum check on every record */
+    FETCHALL();
+
+    /* fetch the specific key back and verify the full key+value */
+    {
+        const char *found_data = NULL;
+        size_t found_datalen = 0;
+        const char *found_key = NULL;
+        size_t found_keylen = 0;
+        r = twom_db_fetch(db, key, keylen, &found_key, &found_keylen,
+                          &found_data, &found_datalen, 0);
+        ASSERT_OK(r);
+        ASSERT_EQ(found_keylen, keylen);
+        ASSERT_EQ(found_datalen, vallen);
+        ASSERT(memcmp(found_key, key, keylen) == 0);
+        ASSERT(memcmp(found_data, val, vallen) == 0);
+    }
+
+    ISCONSISTENT();
+
+    /* replace: exercises FATREPLACE promotion */
+    memset(val, 'W', vallen);
+    CANSTORE(key, keylen, val, vallen);
+    CANCOMMIT();
+
+    FETCHALL();
+
+    {
+        const char *found_data = NULL;
+        size_t found_datalen = 0;
+        r = twom_db_fetch(db, key, keylen, NULL, NULL,
+                          &found_data, &found_datalen, 0);
+        ASSERT_OK(r);
+        ASSERT_EQ(found_datalen, vallen);
+        ASSERT(memcmp(found_data, val, vallen) == 0);
+    }
+
+    ISCONSISTENT();
+
+    /* add a second huge key and a small key, ensure skiplist walk works
+     * (reclen must match real physical size, otherwise the walker would
+     * land in the middle of the previous key's data) */
+    size_t keylen3 = 70000;
+    char *key3 = malloc(keylen3);
+    ASSERT_NOT_NULL(key3);
+    for (size_t i = 0; i < keylen3; i++) key3[i] = (char)((i * 7) & 0xFF);
+
+    CANSTORE(key3, keylen3, "second", 6);
+    CANSTORE("small", 5, "tiny", 4);
+    CANCOMMIT();
+
+    FETCHALL();
+
+    {
+        const char *found_data = NULL;
+        size_t found_datalen = 0;
+        r = twom_db_fetch(db, key3, keylen3, NULL, NULL,
+                          &found_data, &found_datalen, 0);
+        ASSERT_OK(r);
+        ASSERT_EQ(found_datalen, (size_t)6);
+        ASSERT(memcmp(found_data, "second", 6) == 0);
+
+        r = twom_db_fetch(db, "small", 5, NULL, NULL,
+                          &found_data, &found_datalen, 0);
+        ASSERT_OK(r);
+        ASSERT_EQ(found_datalen, (size_t)4);
+        ASSERT(memcmp(found_data, "tiny", 4) == 0);
+    }
+
+    ISCONSISTENT();
+
+    free(key);
+    free(val);
+    free(key3);
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+}
+
+/*
+ * ============================================================
+ * test_dump_corrupt
+ *
+ * Corrupt a record on disk and verify that twom_db_dump does
+ * not crash. Before the sanity checks were added, a bad TYPE
+ * byte would cause RECLEN to dereference reclenfn[] out of
+ * range; and a truncated skinny keylen (the production
+ * corruption pattern) would step offset into the middle of
+ * the previous key's data, reading another garbage byte as
+ * TYPE on the next loop iteration.
+ * ============================================================
+ */
+static void test_dump_corrupt(void)
+{
+    struct twom_db *db = NULL;
+    struct twom_txn *txn = NULL;
+    int r;
+
+    struct twom_open_data init = TWOM_OPEN_DATA_INITIALIZER;
+    init.flags = TWOM_CREATE;
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    /* store a few records so we have something to walk past */
+    CANSTORE("aaa", 3, "val_a", 5);
+    CANSTORE("bbb", 3, "val_b", 5);
+    CANSTORE("ccc", 3, "val_c", 5);
+    CANCOMMIT();
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+
+    /* find the offset of the first user record. The file layout is:
+     *   HEADER (96 bytes)
+     *   DUMMY record (type 1) at offset 96
+     *   first user record immediately after the dummy
+     * Scan forward from just past the header looking for a type-2 (ADD)
+     * byte on an 8-byte boundary. */
+    int fd = open(filename, O_RDWR);
+    ASSERT(fd >= 0);
+    struct stat sb;
+    ASSERT_EQ(fstat(fd, &sb), 0);
+    char *map = malloc(sb.st_size);
+    ASSERT_NOT_NULL(map);
+    ASSERT_EQ((ssize_t)sb.st_size, read(fd, map, sb.st_size));
+
+    /* clobber the TYPE byte of the first ADD record with 0xFF (invalid) */
+    size_t corrupt_off = 0;
+    for (size_t o = 96; o < (size_t)sb.st_size - 24; o += 8) {
+        if ((unsigned char)map[o] == 2) {
+            corrupt_off = o;
+            break;
+        }
+    }
+    free(map);
+    ASSERT(corrupt_off != 0);
+
+    unsigned char bad = 0xFF;
+    ASSERT_EQ((ssize_t)1, pwrite(fd, &bad, 1, corrupt_off));
+    close(fd);
+
+    /* reopen and attempt to dump; it must NOT crash, and must return
+     * cleanly (the walker prints "BAD TYPE" and stops) */
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    fflush(stdout);
+    int saved_stdout = dup(STDOUT_FILENO);
+    int devnull = open("/dev/null", O_WRONLY);
+    dup2(devnull, STDOUT_FILENO);
+    close(devnull);
+
+    r = twom_db_dump(db, 1);
+
+    fflush(stdout);
+    dup2(saved_stdout, STDOUT_FILENO);
+    close(saved_stdout);
+
+    ASSERT_OK(r);
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+}
+
+/*
+ * ============================================================
  * Test runner
  * ============================================================
  */
@@ -4787,6 +4990,8 @@ static struct test_entry tests[] = {
     { "test_compar_reverse",     test_compar_reverse },
     { "test_compar_caseless",    test_compar_caseless },
     { "test_large_key",          test_large_key },
+    { "test_huge_key",           test_huge_key },
+    { "test_dump_corrupt",       test_dump_corrupt },
     { NULL, NULL }
 };
 
