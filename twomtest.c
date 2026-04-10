@@ -4602,6 +4602,127 @@ static void test_compar_caseless(void)
 
 /*
  * ============================================================
+ * test_large_key
+ *
+ * Test keys with length > 32768 (where uint16_t has bit 15 set).
+ * Exercises the skinny record path with key lengths that could
+ * trigger signedness issues in TAILLEN computation.
+ * Uses twom_db_foreach to read every value (triggering tail
+ * checksum verification via twom_cursor_next).
+ * ============================================================
+ */
+static int noop_cb(void *rock __attribute__((unused)),
+                   const char *key __attribute__((unused)),
+                   size_t keylen __attribute__((unused)),
+                   const char *data __attribute__((unused)),
+                   size_t datalen __attribute__((unused)))
+{
+    return 0;
+}
+
+/* read every value in the db, triggering tail checksum checks */
+#define FETCHALL() do { \
+    r = twom_db_foreach(db, NULL, 0, NULL, noop_cb, NULL, 0); \
+    ASSERT_OK(r); \
+} while (0)
+
+static void test_large_key(void)
+{
+    struct twom_db *db = NULL;
+    struct twom_txn *txn = NULL;
+    int r;
+
+    /* allocate a key just over 32k and a value */
+    size_t keylen = 40000;
+    size_t vallen = 100;
+    char *key = malloc(keylen);
+    char *val = malloc(vallen);
+    ASSERT_NOT_NULL(key);
+    ASSERT_NOT_NULL(val);
+    memset(key, 'K', keylen);
+    memset(val, 'V', vallen);
+
+    struct twom_open_data init = TWOM_OPEN_DATA_INITIALIZER;
+    init.flags = TWOM_CREATE;
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    /* store with large key */
+    CANSTORE(key, keylen, val, vallen);
+    CANCOMMIT();
+
+    /* fetch all records - triggers tail checksum check on every record */
+    FETCHALL();
+
+    /* also fetch the specific key back and verify the value */
+    {
+        const char *found_data = NULL;
+        size_t found_datalen = 0;
+        const char *found_key = NULL;
+        size_t found_keylen = 0;
+        r = twom_db_fetch(db, key, keylen, &found_key, &found_keylen,
+                          &found_data, &found_datalen, 0);
+        ASSERT_OK(r);
+        ASSERT_EQ(found_keylen, keylen);
+        ASSERT_EQ(found_datalen, vallen);
+        ASSERT(memcmp(found_key, key, keylen) == 0);
+        ASSERT(memcmp(found_data, val, vallen) == 0);
+    }
+
+    ISCONSISTENT();
+
+    /* replace with a different value */
+    memset(val, 'W', vallen);
+    CANSTORE(key, keylen, val, vallen);
+    CANCOMMIT();
+
+    FETCHALL();
+
+    {
+        const char *found_data = NULL;
+        size_t found_datalen = 0;
+        r = twom_db_fetch(db, key, keylen, NULL, NULL,
+                          &found_data, &found_datalen, 0);
+        ASSERT_OK(r);
+        ASSERT_EQ(found_datalen, vallen);
+        ASSERT(memcmp(found_data, val, vallen) == 0);
+    }
+
+    ISCONSISTENT();
+
+    /* also test at the exact 32768 boundary */
+    size_t keylen2 = 32768;
+    char *key2 = malloc(keylen2);
+    ASSERT_NOT_NULL(key2);
+    memset(key2, 'B', keylen2);
+
+    CANSTORE(key2, keylen2, "boundary", 8);
+    CANCOMMIT();
+
+    FETCHALL();
+
+    {
+        const char *found_data = NULL;
+        size_t found_datalen = 0;
+        r = twom_db_fetch(db, key2, keylen2, NULL, NULL,
+                          &found_data, &found_datalen, 0);
+        ASSERT_OK(r);
+        ASSERT_EQ(found_datalen, (size_t)8);
+        ASSERT(memcmp(found_data, "boundary", 8) == 0);
+    }
+
+    ISCONSISTENT();
+
+    free(key);
+    free(val);
+    free(key2);
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+}
+
+/*
+ * ============================================================
  * Test runner
  * ============================================================
  */
@@ -4665,6 +4786,7 @@ static struct test_entry tests[] = {
     { "test_commit_readonly",    test_commit_readonly },
     { "test_compar_reverse",     test_compar_reverse },
     { "test_compar_caseless",    test_compar_caseless },
+    { "test_large_key",          test_large_key },
     { NULL, NULL }
 };
 
