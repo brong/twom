@@ -3921,6 +3921,118 @@ static void test_recovery_with_records(void)
 
 /*
  * ============================================================
+ * test_consistent_future_links
+ *
+ * A writer that crashes mid-transaction leaves committed records whose
+ * higher-level skip pointers have been rewritten in place to point at
+ * the uncommitted records past current_size ("future links").  The next
+ * process to take a WRITE lock runs recovery and re-stitches them; but a
+ * process that opens the database READ-ONLY (shared lock) cannot recover.
+ *
+ * The invariant: if the database is opened read-only and the committed
+ * snapshot would pass recovery on a write lock, it is consistent.  So the
+ * consistency check must ignore future links on a read-only transaction
+ * rather than reporting broken linkage/tail.
+ * ============================================================
+ */
+static void test_consistent_future_links(void)
+{
+    struct twom_db *db = NULL;
+    struct twom_txn *txn = NULL;
+    int r;
+
+    /* Commit the even-numbered keys.  With this many records several land
+     * at higher skip levels, so there are higher-level pointers that a
+     * later insert will rewrite. */
+    struct twom_open_data init = TWOM_OPEN_DATA_INITIALIZER;
+    init.flags = TWOM_CREATE;
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+
+    char key[32], val[32];
+    for (int i = 0; i < 100; i++) {
+        int kl = snprintf(key, sizeof(key), "key%06d", i * 2);
+        int vl = snprintf(val, sizeof(val), "val%d", i * 2);
+        CANSTORE(key, kl, val, vl);
+    }
+    CANCOMMIT();
+    ASSERT_EQ(twom_db_num_records(db), 100);
+    ISCONSISTENT();
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+    db = NULL;
+
+    /* Fork a child that inserts the odd-numbered keys (each sorting
+     * between two committed keys, so the insert rewrites a committed
+     * record's forward pointers) then crashes via _exit() before
+     * committing.  The in-place MAP_SHARED writes and the DIRTY flag
+     * persist, leaving future links behind. */
+    pid_t pid = fork();
+    ASSERT(pid >= 0);
+    if (pid == 0) {
+        /* === CHILD === */
+        struct twom_open_data cinit = TWOM_OPEN_DATA_INITIALIZER;
+        struct twom_db *cdb = NULL;
+        struct twom_txn *ctxn = NULL;
+
+        int cr = twom_db_open(filename, &cinit, &cdb, NULL);
+        assert(cr == TWOM_OK);
+        cr = twom_db_begin_txn(cdb, 0, &ctxn);
+        assert(cr == TWOM_OK);
+
+        char ck[32], cv[32];
+        for (int i = 0; i < 100; i++) {
+            int kl = snprintf(ck, sizeof(ck), "key%06d", i * 2 + 1);
+            int vl = snprintf(cv, sizeof(cv), "val%d", i * 2 + 1);
+            cr = twom_txn_store(ctxn, ck, kl, cv, vl, 0);
+            assert(cr == TWOM_OK);
+        }
+
+        /* crash: leave the transaction uncommitted and unaborted */
+        _exit(0);
+    }
+
+    /* === PARENT === */
+    int status;
+    waitpid(pid, &status, 0);
+    ASSERT(WIFEXITED(status));
+
+    /* Open READ-ONLY: recovery cannot run, so the future links remain.
+     * The consistency check must tolerate them. */
+    init.flags = TWOM_SHARED;
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+    ISCONSISTENT();
+
+    /* the committed snapshot is intact and the crashed writer's records
+     * are invisible */
+    ASSERT_EQ(twom_db_num_records(db), 100);
+    CANFETCH_NOTXN("key000000", 9, "val0", 4);
+    CANFETCH_NOTXN("key000198", 9, "val198", 6);
+    CANNOTFETCH_NOTXN("key000001", 9, TWOM_NOTFOUND);
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+    db = NULL;
+
+    /* Open READ-WRITE: recovery re-stitches the future links and drops
+     * the uncommitted tail.  Still consistent, committed data intact. */
+    init.flags = 0;
+    r = twom_db_open(filename, &init, &db, NULL);
+    ASSERT_OK(r);
+    ISCONSISTENT();
+    ASSERT_EQ(twom_db_num_records(db), 100);
+    CANFETCH_NOTXN("key000000", 9, "val0", 4);
+    CANFETCH_NOTXN("key000198", 9, "val198", 6);
+    CANNOTFETCH_NOTXN("key000001", 9, TWOM_NOTFOUND);
+
+    r = twom_db_close(&db);
+    ASSERT_OK(r);
+}
+
+/*
+ * ============================================================
  * test_csum_null
  *
  * Open a database with the null checksum engine (always returns 0).
@@ -5186,6 +5298,7 @@ static struct test_entry tests[] = {
     { "test_delete_readd",       test_delete_readd },
     { "test_dump_detail",        test_dump_detail },
     { "test_recovery_with_records", test_recovery_with_records },
+    { "test_consistent_future_links", test_consistent_future_links },
     { "test_mmap_val_reuse",     test_mmap_val_reuse },
     { "test_csum_null",          test_csum_null },
     { "test_csum_external",      test_csum_external },
