@@ -16,7 +16,7 @@ make check          # run the test suite (alias: make test)
 make clean          # remove build artifacts
 ```
 
-Requires: C99 compiler, libuuid (`-luuid`), POSIX (mmap, fcntl locking).
+Requires: C99 compiler, POSIX (mmap, fcntl locking, `/dev/urandom`). Builds on Linux, macOS, and the BSDs with no external libraries.
 
 ## Source Layout
 

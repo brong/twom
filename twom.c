@@ -15,9 +15,8 @@
 #define le32toh(x) OSSwapLittleToHostInt32(x)
 #define htole64(x) OSSwapHostToLittleInt64(x)
 #define le64toh(x) OSSwapLittleToHostInt64(x)
-#ifndef UUID_STR_LEN
-#define UUID_STR_LEN 37
-#endif
+#elif defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__DragonFly__)
+#include <sys/endian.h>
 #else
 #include <endian.h>
 #endif
@@ -25,13 +24,14 @@
 #include <fcntl.h>
 #include <libgen.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
-#include <uuid/uuid.h>
 
 #include "twom.h"
 
@@ -40,6 +40,15 @@
 #define XXH_NO_INLINE_HINTS   1 /* allow compiling with -Og on modern compilers */
 #define XXH_IMPLEMENTATION      /* access definitions */
 #include "xxhash.h"
+
+/* Self-contained UUID (RFC 4122 version 4) support.  We generate and format
+ * UUIDs ourselves rather than depending on util-linux's libuuid, which is not
+ * present in the base system on the BSDs and only needs three trivial
+ * operations here anyway. */
+typedef unsigned char tm_uuid_t[16];
+#define TM_UUID_STR_LEN 37  /* 36 hex/hyphen chars + NUL */
+static void tm_uuid_generate(tm_uuid_t uuid);
+static void tm_uuid_unparse(const tm_uuid_t uuid, char *out);
 
 /********** TUNING *************/
 
@@ -86,7 +95,7 @@ static uint8_t hastail[8]        = { 0,  0,  1,  1,  1,  1,  0,  0 };
 
 struct tm_header {
     /* header info */
-    uuid_t uuid;
+    tm_uuid_t uuid;
     uint32_t version;
     uint32_t flags;
     uint64_t generation;
@@ -180,7 +189,7 @@ struct twom_db {
     void (*error)(const char *msg, const char *fmt, ...);
 
     // scratch space
-    char uuidstr[UUID_STR_LEN];
+    char uuidstr[TM_UUID_STR_LEN];
 
     // flags
     unsigned readonly:1;
@@ -234,6 +243,47 @@ static inline void *twom_zmalloc(size_t bytes)
     memset(res, 0, bytes);
     return res;
 }
+
+/* Fill a 16-byte buffer with a random version-4 UUID.  We read from
+ * /dev/urandom (present on Linux, macOS and every BSD) and fall back to a mix
+ * of weak entropy sources if that is somehow unavailable, so we always produce
+ * a distinct identifier rather than failing. */
+static void tm_uuid_generate(tm_uuid_t uuid)
+{
+    int got = 0;
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd >= 0) {
+        size_t off = 0;
+        while (off < sizeof(tm_uuid_t)) {
+            ssize_t n = read(fd, (char *)uuid + off, sizeof(tm_uuid_t) - off);
+            if (n <= 0) break;
+            off += (size_t)n;
+        }
+        close(fd);
+        got = (off == sizeof(tm_uuid_t));
+    }
+    if (!got) {
+        uint64_t a = (uint64_t)time(NULL);
+        uint32_t b = (uint32_t)getpid();
+        uint32_t c = (uint32_t)(uintptr_t)&fd;
+        memcpy((char *)uuid + 0, &a, 8);
+        memcpy((char *)uuid + 8, &b, 4);
+        memcpy((char *)uuid + 12, &c, 4);
+    }
+    uuid[6] = (unsigned char)((uuid[6] & 0x0f) | 0x40);  /* version 4 */
+    uuid[8] = (unsigned char)((uuid[8] & 0x3f) | 0x80);  /* RFC 4122 variant */
+}
+
+/* Format a UUID as the canonical lowercase 8-4-4-4-12 string, matching the
+ * output of libuuid's uuid_unparse().  out must hold TM_UUID_STR_LEN bytes. */
+static void tm_uuid_unparse(const tm_uuid_t uuid, char *out)
+{
+    snprintf(out, TM_UUID_STR_LEN,
+             "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+             uuid[0], uuid[1], uuid[2], uuid[3], uuid[4], uuid[5], uuid[6], uuid[7],
+             uuid[8], uuid[9], uuid[10], uuid[11], uuid[12], uuid[13], uuid[14], uuid[15]);
+}
+
 /********************** POINTER MANAGEMENT WITHIN THE FILES *********************/
 
 // pad out to an 8 byte boundary
@@ -1923,7 +1973,7 @@ static int initdb(struct twom_db *db, int flags)
     memset(scratch, 0, 512);
 
     // prepare the header
-    uuid_generate(header.uuid);
+    tm_uuid_generate(header.uuid);
     header.version = TWOM_VERSION;
     header.flags = set_csum_engine(db, file, flags);
     if (flags & TWOM_COMPAR_EXTERNAL)
@@ -3013,7 +3063,7 @@ size_t twom_db_size(struct twom_db *db)
 
 const char *twom_db_uuid(struct twom_db *db)
 {
-    uuid_unparse(db->openfile->header.uuid, db->uuidstr);
+    tm_uuid_unparse(db->openfile->header.uuid, db->uuidstr);
     return db->uuidstr;
 }
 

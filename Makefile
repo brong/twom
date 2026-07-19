@@ -14,6 +14,10 @@ AR ?= ar
 CFLAGS ?= -Wall -Wextra -g
 UNAME_S := $(shell uname -s)
 
+# No external libraries are required: UUID generation is self-contained and
+# everything else is POSIX (mmap, fcntl locking).
+LDLIBS =
+
 PREFIX ?= /usr/local
 LIBDIR ?= $(PREFIX)/lib
 INCLUDEDIR ?= $(PREFIX)/include
@@ -25,7 +29,6 @@ PKGCONFIGDIR ?= $(LIBDIR)/pkgconfig
 #   SONAME   - the compatibility name embedded in the library / linked against
 #   LINKNAME - the unversioned developer symlink used at link time
 ifeq ($(UNAME_S),Darwin)
-LDLIBS =
 SOFILE   = libtwom.$(VERSION_MAJOR).$(VERSION_MINOR).$(VERSION_PATCH).dylib
 SONAME   = libtwom.$(VERSION_MAJOR).dylib
 LINKNAME = libtwom.dylib
@@ -34,7 +37,6 @@ SHLIB_LDFLAGS = -dynamiclib \
 	-Wl,-compatibility_version,$(VERSION_MAJOR) \
 	-Wl,-current_version,$(VERSION)
 else
-LDLIBS = -luuid
 SOFILE   = libtwom.so.$(VERSION_MAJOR).$(VERSION_MINOR).$(VERSION_PATCH)
 SONAME   = libtwom.so.$(VERSION_MAJOR)
 LINKNAME = libtwom.so

@@ -24,8 +24,9 @@ This software is available under any of the following licenses, at your choice:
 ## Dependencies
 
 - C compiler (C99)
-- libuuid (`-luuid`)
-- POSIX (mmap, file locking)
+- POSIX (mmap, file locking, `/dev/urandom`)
+
+No external libraries required. Builds on Linux, macOS, and the BSDs.
 
 ## Building
 
